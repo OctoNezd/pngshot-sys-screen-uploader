@@ -1,0 +1,16 @@
+# VitaTG configuration — copy to ux0:data/vitatg/config.txt
+# Lines starting with # or ; are comments.
+
+# https://screenuploader.bakatrouble.me/ is a hosted bridge that
+# forwards screenshots to Telegram/Discord/etc. Register an account,
+# create a Destination, grab its ID, drop it in below.
+#
+# The Vita POSTs the raw PNG body (no multipart wrapping) to
+#   POST /upload/<destination_id>/?filename=<synthesised>.png
+# and the server re-encodes and forwards to your chosen destination.
+# USE http - not https. PS Vita plugins cant do modern TLS it seems, or I am dumb.
+upload_url   = http://screenuploader.bakatrouble.me/upload/<YOUR-DESTINATION-ID>/?filename={filename}
+upload_mode  = raw
+
+# Set to 0 to disable uploads without removing the plugin.
+enabled = 1

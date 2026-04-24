@@ -11,12 +11,18 @@ void abort(void) {
 	__builtin_trap();
 }
 
+/* Current vitasdk exports these as sce_paf_malloc / sce_paf_free (the
+ * original pngshot predates the rename and used the long-since-removed
+ * `_private_` variants, which no longer exist in libScePaf_stub). */
+extern void *sce_paf_malloc(size_t sz);
+extern void  sce_paf_free(void *p);
+
 void *malloc(size_t sz) {
-	return sce_paf_private_malloc(sz);
+	return sce_paf_malloc(sz);
 }
 
 void free(void *p) {
-	sce_paf_private_free(p);
+	sce_paf_free(p);
 }
 
 //////
@@ -142,7 +148,7 @@ int encode_type2(actual_encode_args_t *args) {
 
 	png_set_write_fn(png_ptr, args, write_func, NULL);
 
-	pixels = sce_paf_private_malloc(wh.width * 4);
+	pixels = sce_paf_malloc(wh.width * 4);
 
 	png_write_info(png_ptr, info_ptr);
 
@@ -167,7 +173,7 @@ cleanup:
 		png_destroy_write_struct(&png_ptr, &info_ptr);
 
 	if (pixels)
-		sce_paf_private_free(pixels);
+		sce_paf_free(pixels);
 
 	if (ret < 0)
 		return ret;
@@ -179,7 +185,8 @@ int module_start() {
 	tai_module_info_t info = {0};
 	info.size = sizeof(info);
 	taiGetModuleInfo(TAI_MAIN_MODULE, &info);
-
+    vlog_init();
+    vlog("hi hi");
 	if (info.module_nid == 0x0552F692) { // 3.60 retail
 		// disable watermark
 		taiHookFunctionOffset(&watermark_hook, info.modid, 0, 0x247e00, 1, place_watermark_hook);

@@ -1,10 +1,10 @@
-cmake_minimum_required(VERSION 2.8)
+cmake_minimum_required(VERSION 3.5)
 
 if(NOT DEFINED CMAKE_TOOLCHAIN_FILE)
   if(DEFINED ENV{VITASDK})
     set(CMAKE_TOOLCHAIN_FILE "$ENV{VITASDK}/share/vita.toolchain.cmake" CACHE PATH "toolchain file")
   else()
-    message(FATAL_ERROR "Please define VITASDK to point to your SDK path!")
+    set(CMAKE_TOOLCHAIN_FILE "/usr/local/vitasdk/share/vita.toolchain.cmake" CACHE PATH "toolchain file")
   endif()
 endif()
 
@@ -16,6 +16,7 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-rtti -fno-exceptions")
 
 add_executable(pngshot
   main.c
+  log.c
 )
 
 target_link_libraries(pngshot
@@ -27,6 +28,11 @@ target_link_libraries(pngshot
   taihen_stub
   ScePaf_stub_weak
   SceSysmem_stub
+  # sceClibPrintf / sceClibVsnprintf live in SceLibKernel. Use the
+  # weak stub so taiHEN's loader is happy even if the host process
+  # (SceShell) doesn't already import SceLibKernel — the sysmodule
+  # will be available at runtime anyway.
+  SceLibKernel_stub_weak
 )
 
 vita_create_self(pngshot.suprx pngshot CONFIG exports.yml UNSAFE)

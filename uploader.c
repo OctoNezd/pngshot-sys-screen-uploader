@@ -58,6 +58,7 @@ typedef struct {
     SceUID      blk;       /* MemBlock holding the body */
     void       *body;      /* base pointer inside blk */
     int         len;
+    int         attempts;  /* how many times we've tried to send */
     SceDateTime stamp;     /* capture time, for filename synthesis */
 } job_t;
 
@@ -119,10 +120,29 @@ static int http_ensure(void) {
     return 0;
 }
 
-static int net_ready(void) {
+/* SceShell already brings the net stack up, but we may race it on
+ * boot, or Wi-Fi may be asleep when the user takes a screenshot right
+ * after waking from standby. Try to nudge it awake once per call and
+ * then poll for up to `wait_us` microseconds. Return 1 when we see
+ * state == 3 (SCE_NETCTL_STATE_CONNECTED). */
+static int net_wait_ready(unsigned wait_us) {
     int state = 0;
-    if (sceNetCtlInetGetState(&state) < 0) return 0;
-    return state == 3;
+    unsigned waited = 0;
+    const unsigned step = 500 * 1000;  /* 500 ms poll */
+
+    /* Initial check: if we're already up, return immediately. */
+    if (sceNetCtlInetGetState(&state) >= 0 && state == 3) return 1;
+
+    /* sceNetCtlInetGetState returning >=0 with state != 3 means the
+     * stack is available but not connected. We can't programmatically
+     * re-associate to Wi-Fi from user-mode without triggering system
+     * UI, but polling gives the user / SceShell time to finish it. */
+    while (waited < wait_us) {
+        sceKernelDelayThread(step);
+        waited += step;
+        if (sceNetCtlInetGetState(&state) >= 0 && state == 3) return 1;
+    }
+    return 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -176,13 +196,22 @@ static void url_with_filename(const char *tmpl, const char *fname,
 /* ------------------------------------------------------------------ */
 /* Core HTTP POST                                                     */
 /* ------------------------------------------------------------------ */
+/* Return codes:
+ *    0 : upload succeeded.
+ *   -1 : permanent failure (HTTP 4xx, bad URL, etc). No retry.
+ *   -2 : transient failure (network down, 5xx, send/read error).
+ *        Caller should reschedule.
+ */
 static int send_buffer(const ps_config_t *cfg,
                        const void *png_data, int png_len,
                        const SceDateTime *stamp) {
     if (!cfg->enabled) return 0;
-    if (http_ensure() < 0) return -1;
-    if (!net_ready()) {
-        vlog("net not ready, skipping upload");
+    if (http_ensure() < 0) return -2;
+    /* Wait up to 15 s for the network to come up (e.g. just woke from
+     * standby). If we time out, treat as transient so the retry loop
+     * gets another crack at it later. */
+    if (!net_wait_ready(15 * 1000 * 1000)) {
+        vlog("net not ready, will retry");
         return -2;
     }
 
@@ -212,7 +241,8 @@ static int send_buffer(const ps_config_t *cfg,
 
     int send_rc = sceHttpSendRequest(req, (void *)png_data, (unsigned int)png_len);
     if (send_rc < 0) {
-        vlog("SendRequest 0x%08X url=%s", send_rc, url);
+        vlog("SendRequest 0x%08X url=%s (will retry)", send_rc, url);
+        rc = -2;   /* transient */
         goto out;
     }
 
@@ -234,7 +264,13 @@ static int send_buffer(const ps_config_t *cfg,
     if (status >= 200 && status < 300) {
         vlog("upload ok: %d bytes -> %s (HTTP %d)", png_len, url, status);
         rc = 0;
+    } else if (status >= 500 || status == 408 || status == 429) {
+        /* Server-side hiccup / rate-limit — retry. */
+        vlog("upload fail status=%d url=%s resp=%s (will retry)", status, url, resp);
+        rc = -2;
     } else {
+        /* 4xx other than rate-limit: the config is probably wrong.
+         * No point burning retries on a permanent error. */
         vlog("upload fail status=%d url=%s resp=%s", status, url, resp);
         rc = -1;
     }
@@ -275,14 +311,33 @@ int ps_uploader_enqueue(const void *buf, int len, const SceDateTime *stamp) {
     ps_memcpy(body, buf, len);
 
     job_t *j = &g_ring[g_ring_tail];
-    j->blk   = blk;
-    j->body  = body;
-    j->len   = len;
-    j->stamp = *stamp;
+    j->blk      = blk;
+    j->body     = body;
+    j->len      = len;
+    j->attempts = 0;
+    j->stamp    = *stamp;
     g_ring_tail = (g_ring_tail + 1) % PS_UPLOAD_QUEUE;
     g_ring_count++;
     sceKernelUnlockMutex(g_pipe_mtx, 1);
 
+    sceKernelSignalSema(g_pipe_sem, 1);
+    return 0;
+}
+
+/* Re-insert a job at the head of the ring for another try. The ring
+ * is small; if someone else filled the last slot while we were
+ * uploading, the retry is dropped (we log and move on). */
+static int requeue_head(job_t *j) {
+    sceKernelLockMutex(g_pipe_mtx, 1, NULL);
+    if (g_ring_count >= PS_UPLOAD_QUEUE) {
+        sceKernelUnlockMutex(g_pipe_mtx, 1);
+        return -1;
+    }
+    /* Walk head back one slot. */
+    g_ring_head = (g_ring_head + PS_UPLOAD_QUEUE - 1) % PS_UPLOAD_QUEUE;
+    g_ring[g_ring_head] = *j;
+    g_ring_count++;
+    sceKernelUnlockMutex(g_pipe_mtx, 1);
     sceKernelSignalSema(g_pipe_sem, 1);
     return 0;
 }
@@ -315,10 +370,36 @@ static int uploader_thread(SceSize args, void *argp) {
         g_ring_count--;
         sceKernelUnlockMutex(g_pipe_mtx, 1);
 
-        /* Re-read config on each upload so toggling `enabled` or
-         * swapping `upload_url` takes effect without a reboot. */
-        if (ps_cfg_load(&cfg) == 0 && cfg.enabled) {
-            send_buffer(&cfg, j.body, j.len, &j.stamp);
+        /* Re-read config on each attempt so toggling `enabled` or
+         * swapping `upload_url` takes effect without a reboot. If the
+         * user has disabled or removed the config since the shot was
+         * queued, drop the buffer. */
+        if (ps_cfg_load(&cfg) != 0 || !cfg.enabled) {
+            big_free(j.blk);
+            continue;
+        }
+
+        j.attempts++;
+        int rc = send_buffer(&cfg, j.body, j.len, &j.stamp);
+
+        if (rc == -2 && j.attempts < PS_MAX_ATTEMPTS) {
+            /* Transient failure — back off (linear, starting at
+             * PS_RETRY_BASE_US) and requeue. With the defaults that's
+             * 10 s, 20 s, 30 s, ... between attempts. Avoiding
+             * exponential growth so a transient outage finishes its
+             * retry budget inside ~1 min rather than stretching for
+             * half an hour. */
+            unsigned backoff = PS_RETRY_BASE_US * (unsigned)j.attempts;
+            vlog("retry %d/%d in %u s", j.attempts, PS_MAX_ATTEMPTS,
+                 backoff / 1000000u);
+            sceKernelDelayThread(backoff);
+            if (requeue_head(&j) == 0) {
+                /* requeue took ownership of the MemBlock. */
+                continue;
+            }
+            vlog("requeue failed (queue full); dropping");
+        } else if (rc == -2) {
+            vlog("giving up after %d attempts", j.attempts);
         }
 
         big_free(j.blk);

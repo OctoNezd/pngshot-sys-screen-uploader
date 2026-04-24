@@ -40,7 +40,14 @@
 #define PS_CONFIG_PATH     "ux0:data/pngshot-ssu/config.txt"
 
 #define PS_MAX_UPLOAD_SIZE (8 * 1024 * 1024)  /* 8 MB sanity cap */
-#define PS_UPLOAD_QUEUE    4                  /* max queued uploads */
+#define PS_UPLOAD_QUEUE    8                  /* max queued uploads */
+
+/* Retry policy. If the network is down, or the POST fails, we'll
+ * re-try the same job up to PS_MAX_ATTEMPTS times, sleeping a bit
+ * longer between each attempt. 6 * 10 s ≈ 1 min of retries per shot,
+ * which is plenty for the Vita's Wi-Fi to reconnect after standby. */
+#define PS_MAX_ATTEMPTS    6
+#define PS_RETRY_BASE_US   (10 * 1000 * 1000)  /* 10 s */
 
 /* Config --------------------------------------------------------------- */
 

@@ -19,6 +19,6 @@ EOF
 export -f upload_file
 
 cd build
-upload_file pngshot.suprx ur0:tai/
+upload_file pngshot-ssu.suprx ur0:tai/
 cd ..
-upload_file config.txt ux0:data/vitatg/
+upload_file config.txt ux0:data/pngshot-ssu/

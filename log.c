@@ -1,9 +1,9 @@
-/* Log everything through sceClibPrintf. princesslog (and
- * psp2shell / netdbg) will pick these up. No file logs are written —
- * we don't want to scribble over the user's FS. */
+/* Log through sceClibPrintf — visible via princesslog / psp2shell /
+ * netdbg. We deliberately don't touch the filesystem from the logger
+ * to keep the encode hook (which runs on SceShell's UI thread while
+ * a screenshot is being written) as light as possible. */
 
-#include <stdarg.h>              /* va_list, va_start, va_end */
-#include <psp2/kernel/clib.h>    /* sceClibPrintf, sceClibVsnprintf */
+#include "pngshot.h"
 
 void vlog_init(void) { /* nothing */ }
 
@@ -11,7 +11,7 @@ void vlog(const char *fmt, ...) {
     char msg[512];
     va_list ap;
     va_start(ap, fmt);
-    sceClibVsnprintf(msg, sizeof(msg), fmt, ap);
+    ps_vsnprintf(msg, sizeof(msg), fmt, ap);
     va_end(ap);
-    sceClibPrintf("[pngshot-screenuploader] %s\n", msg);
+    sceClibPrintf("[pngshot-ssu] %s\n", msg);
 }

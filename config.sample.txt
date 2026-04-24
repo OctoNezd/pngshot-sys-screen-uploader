@@ -1,16 +1,21 @@
-# VitaTG configuration — copy to ux0:data/vitatg/config.txt
-# Lines starting with # or ; are comments.
-
-# https://screenuploader.bakatrouble.me/ is a hosted bridge that
-# forwards screenshots to Telegram/Discord/etc. Register an account,
-# create a Destination, grab its ID, drop it in below.
+# pngshot-sys-screenuploader config
 #
-# The Vita POSTs the raw PNG body (no multipart wrapping) to
-#   POST /upload/<destination_id>/?filename=<synthesised>.png
-# and the server re-encodes and forwards to your chosen destination.
-# USE http - not https. PS Vita plugins cant do modern TLS it seems, or I am dumb.
-upload_url   = http://screenuploader.bakatrouble.me/upload/<YOUR-DESTINATION-ID>/?filename={filename}
-upload_mode  = raw
+# Install to: ux0:data/pngshot-ssu/config.txt
+#
+# `upload_url` is REQUIRED. It's the endpoint a sys-screenuploader-
+# compatible server listens on; pngshot-ssu will send a POST with
+# Content-Type: image/png and the raw PNG as the body.
+#
+# The special token `{filename}` is expanded to the synthesised
+# sys-screenuploader filename  YYYYMMDDhhmmss00-<32×hex>.png  so your
+# server can use the same filename parsing as the stock Switch tool.
+#
+# Prefer plain http:// when possible. Modern https:// endpoints using
+# Let's Encrypt / ISRG Root X1 will fail the TLS handshake — the Vita
+# CA bundle predates that root. Self-signed / older CAs are accepted
+# (we register an accept-all SSL callback).
+
+upload_url = http://screenuploader.bakatrouble.me/upload/PUT_DEST_ID_HERE/?filename={filename}
 
 # Set to 0 to disable uploads without removing the plugin.
 enabled = 1

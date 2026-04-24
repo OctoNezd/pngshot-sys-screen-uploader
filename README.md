@@ -10,9 +10,9 @@ pngshot is a plugin to make screenshots great again.
 
 ## Installation
 
-Download from the [Releases section](https://github.com/xyzz/pngshot/releases).
+Download from the [Releases section](https://github.com/octonezd/pngshot-ssu/releases).
 
-Copy `pngshot.suprx` to `ur0:tai` and add `ur0:tai/pngshot.suprx` below `*main` in `ur0:tai/config.txt`.
+Copy `pngshot-ssu.suprx` to `ur0:tai` and add `ur0:tai/pngshot-ssu.suprx` below `*main` in `ur0:tai/config.txt`.
 
 Note that this was only tested with retail SceShell. If, for some reason, you have some weird modifications done to your SceShell, this plugin will probably crash your Vita.
 

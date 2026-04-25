@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  repository_dispatch:
+    types: [ run_build ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: vitasdk/vitasdk:latest
+    steps:
+      - uses: actions/checkout@v2
+      - name: prep for artifacts
+        run: apk add nodejs
+      - name: setup non-root for libpng
+        run: |
+          adduser nonroot -D -H
+          apk add doas
+          echo permit nopass keepenv setenv { PATH } root as nonroot > /etc/doas.d/doas.conf
+          echo $PATH
+          ls -la /usr/local/vitasdk/bin
+      - name: build libpng
+        run: |
+          chmod 777 libpng -R
+          cd libpng
+          doas -u nonroot env
+          doas -u nonroot vita-makepkg
+          vdpm libpng-1.6.29-1-arm.tar.xz
+      - name: cmake
+        run: |
+          mkdir build
+          cd build
+          cmake ..
+      - name: Compile project
+        run: |
+          cd build
+          make
+      - name: Archive build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          path: build/pngshot-ssu.suprx
+      - name: version variable
+        run: |
+          export APP_VER=$(cat version.txt)
+      - name: Draft Release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          tag_name: "${{ env.APP_VER }}"
+          files: build/pngshot-ssu.suprx
+
+# https://github.com/OctoNezd/VNDS-LOVE-TOUCH/blob/main/.github/workflows/main.yml

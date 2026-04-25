@@ -156,7 +156,6 @@ typedef struct {
     SceUID      blk;       /* MemBlock holding the body */
     void       *body;      /* base pointer inside blk */
     int         len;
-    int         attempts;  /* how many times we've tried to send */
     int         notify;    /* if non-zero: pop a toast on success/failure */
     SceDateTime stamp;     /* capture time, for filename synthesis */
 } job_t;
@@ -297,20 +296,18 @@ static void url_with_filename(const char *tmpl, const char *fname,
 /* ------------------------------------------------------------------ */
 /* Return codes:
  *    0 : upload succeeded.
- *   -1 : permanent failure (HTTP 4xx, bad URL, etc). No retry.
+ *   -1 : permanent failure (HTTP 4xx, bad URL, etc).
  *   -2 : transient failure (network down, 5xx, send/read error).
- *        Caller should reschedule.
  */
 static int send_buffer(const ps_config_t *cfg,
                        const void *png_data, int png_len,
                        const SceDateTime *stamp) {
     if (!cfg->enabled) return 0;
     if (http_ensure() < 0) return -2;
-    /* Wait up to 15 s for the network to come up (e.g. just woke from
-     * standby). If we time out, treat as transient so the retry loop
-     * gets another crack at it later. */
+    /* Give the network up to 15 s to come up (e.g. just woke from
+     * standby) before giving up. */
     if (!net_wait_ready(15 * 1000 * 1000)) {
-        vlog("net not ready, will retry");
+        vlog("net not ready");
         return -2;
     }
 
@@ -340,7 +337,7 @@ static int send_buffer(const ps_config_t *cfg,
 
     int send_rc = sceHttpSendRequest(req, (void *)png_data, (unsigned int)png_len);
     if (send_rc < 0) {
-        vlog("SendRequest 0x%08X url=%s (will retry)", send_rc, url);
+        vlog("SendRequest 0x%08X url=%s", send_rc, url);
         rc = -2;   /* transient */
         goto out;
     }
@@ -364,12 +361,11 @@ static int send_buffer(const ps_config_t *cfg,
         vlog("upload ok: %d bytes -> %s (HTTP %d)", png_len, url, status);
         rc = 0;
     } else if (status >= 500 || status == 408 || status == 429) {
-        /* Server-side hiccup / rate-limit — retry. */
-        vlog("upload fail status=%d url=%s resp=%s (will retry)", status, url, resp);
+        /* Server-side hiccup / rate-limit. */
+        vlog("upload fail status=%d url=%s resp=%s", status, url, resp);
         rc = -2;
     } else {
-        /* 4xx other than rate-limit: the config is probably wrong.
-         * No point burning retries on a permanent error. */
+        /* 4xx other than rate-limit: the config is probably wrong. */
         vlog("upload fail status=%d url=%s resp=%s", status, url, resp);
         rc = -1;
     }
@@ -414,7 +410,6 @@ int ps_uploader_enqueue_notify(const void *buf, int len,
     j->blk      = blk;
     j->body     = body;
     j->len      = len;
-    j->attempts = 0;
     j->notify   = notify ? 1 : 0;
     j->stamp    = *stamp;
     g_ring_tail = (g_ring_tail + 1) % PS_UPLOAD_QUEUE;
@@ -429,23 +424,6 @@ int ps_uploader_enqueue(const void *buf, int len, const SceDateTime *stamp) {
     return ps_uploader_enqueue_notify(buf, len, stamp, 0);
 }
 
-/* Re-insert a job at the head of the ring for another try. The ring
- * is small; if someone else filled the last slot while we were
- * uploading, the retry is dropped (we log and move on). */
-static int requeue_head(job_t *j) {
-    sceKernelLockMutex(g_pipe_mtx, 1, NULL);
-    if (g_ring_count >= PS_UPLOAD_QUEUE) {
-        sceKernelUnlockMutex(g_pipe_mtx, 1);
-        return -1;
-    }
-    /* Walk head back one slot. */
-    g_ring_head = (g_ring_head + PS_UPLOAD_QUEUE - 1) % PS_UPLOAD_QUEUE;
-    g_ring[g_ring_head] = *j;
-    g_ring_count++;
-    sceKernelUnlockMutex(g_pipe_mtx, 1);
-    sceKernelSignalSema(g_pipe_sem, 1);
-    return 0;
-}
 
 /* ------------------------------------------------------------------ */
 /* Worker                                                             */
@@ -484,44 +462,39 @@ static int uploader_thread(SceSize args, void *argp) {
             continue;
         }
 
-        j.attempts++;
         int rc = send_buffer(&cfg, j.body, j.len, &j.stamp);
 
-        if (rc == -2 && j.attempts < PS_MAX_ATTEMPTS) {
-            /* Transient failure — back off (linear, starting at
-             * PS_RETRY_BASE_US) and requeue. With the defaults that's
-             * 10 s, 20 s, 30 s, ... between attempts. Avoiding
-             * exponential growth so a transient outage finishes its
-             * retry budget inside ~1 min rather than stretching for
-             * half an hour. */
-            unsigned backoff = PS_RETRY_BASE_US * (unsigned)j.attempts;
-            vlog("retry %d/%d in %u s", j.attempts, PS_MAX_ATTEMPTS,
-                 backoff / 1000000u);
-            sceKernelDelayThread(backoff);
-            if (requeue_head(&j) == 0) {
-                /* requeue took ownership of the MemBlock. */
-                continue;
-            }
-            vlog("requeue failed (queue full); dropping");
-            /* Fall through to terminal failure path so the toast
-             * (if any) gets emitted, then the body is freed. */
-            rc = -2;
-        }
-
-        /* Terminal toast — only when caller asked (j.notify), and
-         * only on definite outcomes (not the requeue-and-continue
-         * case above, which `continue`d out of the loop). */
+        /* Terminal feedback split by who asked for the upload:
+         *
+         *   notify=1 (Photos share):  modal MsgDialog inside Photos.
+         *     Always shown — success ("Screenshot uploaded") or
+         *     failure ("...failed (0x........)"). Photos is fore-
+         *     ground and the user is actively waiting.
+         *
+         *   notify=0 (SceShell screenshot path): silent on success
+         *     (the user didn't ask for any UI). On failure, fire a
+         *     SceShell toast with the sce-style error code so the
+         *     user notices and can grep / report.
+         */
         if (j.notify) {
             if (rc == 0) {
                 ps_notify("Screenshot uploaded");
-            } else if (rc == -1) {
-                ps_notify("Upload failed (check config)");
-            } else { /* rc == -2 after exhausting retries */
-                ps_notify("Upload failed (network)");
+            } else {
+                /* err_code is the most useful diagnostic we can
+                 * surface — pass our internal rc through as a
+                 * stand-in if no HTTP-specific code is available. */
+                char msg[128];
+                ps_snprintf(msg, sizeof(msg),
+                            "Screenshot upload failed (0x%08X)",
+                            (unsigned)rc);
+                ps_notify(msg);
             }
-        }
-        if (rc == -2) {
-            vlog("giving up after %d attempts", j.attempts);
+        } else if (rc != 0) {
+            char msg[128];
+            ps_snprintf(msg, sizeof(msg),
+                        "Screenshot upload failed (0x%08X)",
+                        (unsigned)rc);
+            ps_notify_shell(msg);
         }
 
         big_free(j.blk);

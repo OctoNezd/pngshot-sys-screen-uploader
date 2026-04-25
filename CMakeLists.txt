@@ -21,7 +21,9 @@ add_executable(pngshot-ssu
   log.c
   config.c
   uploader.c
+  notify_sceshell.c
 )
+
 
 target_link_libraries(pngshot-ssu
   png16
@@ -46,6 +48,7 @@ target_link_libraries(pngshot-ssu
   SceSysmodule_stub_weak
   SceRtc_stub_weak
   SceCommonDialog_stub_weak      # SceMsgDialog used for upload-result popup
+  SceKernelModulemgr_stub_weak   # sceKernelGetModuleInfo for SceShell offset resolution
 )
 
 vita_create_self(pngshot-ssu.suprx pngshot-ssu CONFIG exports.yml UNSAFE)

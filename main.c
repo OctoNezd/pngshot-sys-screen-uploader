@@ -381,6 +381,7 @@ int module_start() {
 	ps_uploader_start();
 
 	if (info.module_nid == 0x0552F692) { // 3.60 retail
+
 		// disable watermark
 		taiHookFunctionOffset(&watermark_hook, info.modid, 0, 0x247e00, 1, place_watermark_hook);
 
@@ -454,3 +455,4 @@ int module_stop() {
 	ps_uploader_stop();
 	return 0;
 }
+

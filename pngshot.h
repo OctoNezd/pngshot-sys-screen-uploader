@@ -42,12 +42,6 @@
 #define PS_MAX_UPLOAD_SIZE (8 * 1024 * 1024)  /* 8 MB sanity cap */
 #define PS_UPLOAD_QUEUE    8                  /* max queued uploads */
 
-/* Retry policy. If the network is down, or the POST fails, we'll
- * re-try the same job up to PS_MAX_ATTEMPTS times, sleeping a bit
- * longer between each attempt. 6 * 10 s ≈ 1 min of retries per shot,
- * which is plenty for the Vita's Wi-Fi to reconnect after standby. */
-#define PS_MAX_ATTEMPTS    6
-#define PS_RETRY_BASE_US   (10 * 1000 * 1000)  /* 10 s */
 
 /* Config --------------------------------------------------------------- */
 
@@ -98,9 +92,16 @@ int  ps_uploader_enqueue_notify(const void *buf, int len,
 int  ps_uploader_start(void);
 void ps_uploader_stop(void);
 
-/* On-screen toast (top-right system notification, like trophy popups).
- * Safe to call from any thread; the SceShell renders the bubble.
- * `text` is plain ASCII; we'll widen it to UTF-16 internally. */
+/* Modal popup. Used inside the Photos process for both success and
+ * failure feedback — Photos already has a CommonDialog render loop
+ * running so SceMsgDialog "just works" there with no GXM setup on
+ * our part. */
 void ps_notify(const char *text);
+
+/* Top-right toast bubble, fired through SceShell's *internal* notice
+ * builders (Princess-of-Sleeping PoC). Only resolves from inside the
+ * SceShell process; in any other process this is a silent no-op.
+ * Tap-action launches Photos (NPXS10004). */
+void ps_notify_shell(const char *text);
 
 #endif

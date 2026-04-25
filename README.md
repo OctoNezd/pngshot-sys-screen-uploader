@@ -24,7 +24,7 @@ Download from the [Releases section](https://github.com/octonezd/pngshot-ssu/rel
 
 Copy `pngshot-ssu.suprx` to `ur0:tai` and add `ur0:tai/pngshot-ssu.suprx` below `*main` in `ur0:tai/config.txt`.
 
-If you also want the (currently log-only) Photos app email hook to fire, add the plugin under `*NPXS10004` as well:
+If you also want the Photos app email hook to upload photos to ssu, add the plugin under `*NPXS10004` as well:
 
 ```
 *NPXS10004

@@ -85,6 +85,16 @@ int  ps_cfg_present(void);
  * worker thread performs the HTTP POST. Returns 0 if queued. */
 int  ps_uploader_enqueue(const void *buf, int len, const SceDateTime *stamp);
 
+/* Variant that takes ownership of an on-disk staging file instead of
+ * a memory buffer. The worker is responsible for deleting `path` when
+ * it's done (success or fail). Used by the SceShell encode hook to
+ * keep the giant PNG out of RAM during the encode burst — the only
+ * allocation big enough to fail happens later, in the worker. Returns
+ * 0 if queued. On failure the caller should unlink `path` itself. */
+int  ps_uploader_enqueue_file(const char *path, int len,
+                              const SceDateTime *stamp);
+
+
 /* Same as ps_uploader_enqueue, but emits a system toast popup
  * (success/failure) when the job finishes. Used by the photos-app
  * email-hook path so users get visual feedback that their share

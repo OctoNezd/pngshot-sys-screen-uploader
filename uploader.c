@@ -26,8 +26,11 @@
 #include <psp2/sysmodule.h>
 #include <psp2/kernel/sysmem.h>
 #include <psp2/kernel/threadmgr.h>
+#include <psp2/io/fcntl.h>
+#include <psp2/io/stat.h>
 #include <psp2/message_dialog.h>
 #include <psp2/common_dialog.h>
+
 
 /* ------------------------------------------------------------------ */
 /* Dedicated MemBlock allocator for upload bodies. A Vita screenshot  */
@@ -244,13 +247,31 @@ void ps_progress_hide(void) {
 /* Queue                                                              */
 /* ------------------------------------------------------------------ */
 
+/* A queued upload comes in one of two flavours:
+ *
+ *   in-RAM (Photos share): the caller already has the PNG buffered
+ *     and we copy it into our own MemBlock at enqueue time. `path`
+ *     is empty.
+ *
+ *   on-disk (SceShell encode hook): the caller streamed the PNG
+ *     into a staging file to keep memory pressure off the encode
+ *     thread. `body`/`blk` start unset; the worker mmap-style-reads
+ *     the file into a fresh MemBlock right before sending, so the
+ *     one big allocation happens *after* the encode burst is over.
+ *     The worker also unlinks the file when it's done.
+ */
 typedef struct {
-    SceUID      blk;       /* MemBlock holding the body */
-    void       *body;      /* base pointer inside blk */
+    SceUID      blk;       /* MemBlock holding the body, -1 for file mode */
+    void       *body;      /* base pointer inside blk, NULL for file mode */
     int         len;
     int         notify;    /* if non-zero: pop a toast on success/failure */
+    int         keep_file; /* file mode: 1 = leave file alone (shared with
+                            *            SceShell), 0 = unlink after read */
+    char        path[128]; /* staging file, empty string for in-RAM mode */
     SceDateTime stamp;     /* capture time, for filename synthesis */
 } job_t;
+
+
 
 static SceUID g_pipe_mtx = -1;     /* protects ring */
 static SceUID g_pipe_sem = -1;     /* counts queued jobs */
@@ -533,11 +554,13 @@ int ps_uploader_enqueue_notify(const void *buf, int len,
     ps_memcpy(body, buf, len);
 
     job_t *j = &g_ring[g_ring_tail];
-    j->blk      = blk;
-    j->body     = body;
-    j->len      = len;
-    j->notify   = notify ? 1 : 0;
-    j->stamp    = *stamp;
+    j->blk       = blk;
+    j->body      = body;
+    j->len       = len;
+    j->notify    = notify ? 1 : 0;
+    j->keep_file = 0;       /* in-RAM mode owns nothing on disk */
+    j->path[0]   = '\0';
+    j->stamp     = *stamp;
     g_ring_tail = (g_ring_tail + 1) % PS_UPLOAD_QUEUE;
     g_ring_count++;
     sceKernelUnlockMutex(g_pipe_mtx, 1);
@@ -547,8 +570,125 @@ int ps_uploader_enqueue_notify(const void *buf, int len,
 }
 
 int ps_uploader_enqueue(const void *buf, int len, const SceDateTime *stamp) {
+
     return ps_uploader_enqueue_notify(buf, len, stamp, 0);
 }
+
+/* File-mode enqueue: defer reading the PNG body until the worker
+ * actually wants to send it. The job carries just the staging path
+ * + expected length; the worker stat()s the file, allocates a single
+ * MemBlock of exactly that size, slurps the bytes in, POSTs them,
+ * frees the block, and unlinks the file. The expensive contiguous
+ * allocation thus happens *after* the encode burst, when SceShell's
+ * memory pressure is at its lowest. */
+int ps_uploader_enqueue_file(const char *path, int len,
+                             const SceDateTime *stamp) {
+    if (!path || !path[0] || len <= 0 || len > PS_MAX_UPLOAD_SIZE) {
+        vlog("enqueue_file: bad args path=%s len=%d", path ? path : "(null)", len);
+        return -1;
+    }
+    if (g_pipe_mtx < 0) {
+        vlog("enqueue_file: uploader not started");
+        return -1;
+    }
+
+    sceKernelLockMutex(g_pipe_mtx, 1, NULL);
+    if (g_ring_count >= PS_UPLOAD_QUEUE) {
+        sceKernelUnlockMutex(g_pipe_mtx, 1);
+        vlog("enqueue_file: queue full, dropping");
+        return -1;
+    }
+
+    job_t *j = &g_ring[g_ring_tail];
+    j->blk      = -1;
+    j->body     = NULL;
+    j->len      = len;
+    j->notify   = 0;
+    /* The path is shared with SceShell (it's the same capture.png
+     * SceShell writes after every screenshot). Don't unlink it from
+     * under SceShell — the next screenshot just overwrites it, and
+     * removing it could confuse SceShell's own bookkeeping. */
+    j->keep_file = 1;
+    /* Bound-check + null-terminate. The path comes from main.c's
+     * 128-byte staging-name builder, so this is just defensive. */
+    size_t pl = ps_strlen(path);
+    if (pl >= sizeof(j->path)) pl = sizeof(j->path) - 1;
+    ps_memcpy(j->path, path, pl);
+    j->path[pl] = '\0';
+    j->stamp    = *stamp;
+
+    g_ring_tail = (g_ring_tail + 1) % PS_UPLOAD_QUEUE;
+    g_ring_count++;
+    sceKernelUnlockMutex(g_pipe_mtx, 1);
+
+    sceKernelSignalSema(g_pipe_sem, 1);
+    return 0;
+}
+
+/* Wait for `path` to exist and reach at least `expected` bytes. Used
+ * before reading SceShell's capture.png — SceShell flushes that file
+ * *after* our encode hook returns, so the worker may briefly see it
+ * missing or short. 5 s @ 50 ms = 100 polls is far more than the
+ * eMMC ever needs and still bounded if SceShell decides to skip the
+ * write entirely (e.g. user cancelled the screenshot). */
+static int wait_file_ready(const char *path, int expected) {
+    SceIoStat st;
+    for (int i = 0; i < 100; i++) {
+        ps_memset(&st, 0, sizeof(st));
+        if (sceIoGetstat(path, &st) >= 0 &&
+            (int)st.st_size >= expected) {
+            return 0;
+        }
+        sceKernelDelayThread(50 * 1000);
+    }
+    return -1;
+}
+
+/* Slurp a staging file into a freshly-allocated MemBlock. Returns
+ * the buffer (and SceUID via *out_blk) on success, NULL on any
+ * failure (alloc, open, short read). Caller frees on success. */
+static void *load_staging_file(const char *path, int len, SceUID *out_blk) {
+    *out_blk = -1;
+
+    /* SceShell writes capture.png *after* our encode hook returns,
+     * so the worker normally beats SceShell to the file. Block here
+     * until the on-disk size matches what the encoder reported, or
+     * give up after a few seconds. */
+    if (wait_file_ready(path, len) < 0) {
+        vlog("load_staging: %s did not reach %d bytes in time", path, len);
+        return NULL;
+    }
+
+    SceUID blk;
+    void *body = big_alloc((size_t)len, &blk);
+    if (!body) return NULL;
+
+    SceUID fd = sceIoOpen(path, SCE_O_RDONLY, 0);
+    if (fd < 0) {
+        vlog("load_staging: open %s failed 0x%08X", path, fd);
+        big_free(blk);
+        return NULL;
+    }
+
+
+    int total = 0;
+    while (total < len) {
+        int r = sceIoRead(fd, (char *)body + total, len - total);
+        if (r <= 0) {
+            vlog("load_staging: read %s short %d/%d (rc=%d)",
+                 path, total, len, r);
+            sceIoClose(fd);
+            big_free(blk);
+            return NULL;
+        }
+        total += r;
+    }
+    sceIoClose(fd);
+
+    *out_blk = blk;
+    return body;
+}
+
 
 
 /* ------------------------------------------------------------------ */
@@ -582,18 +722,46 @@ static int uploader_thread(SceSize args, void *argp) {
         /* Re-read config on each attempt so toggling `enabled` or
          * swapping `upload_url` takes effect without a reboot. If the
          * user has disabled or removed the config since the shot was
-         * queued, drop the buffer. */
+         * queued, drop the buffer / file. */
+        int file_mode = (j.path[0] != '\0');
         if (ps_cfg_load(&cfg) != 0 || !cfg.enabled) {
-            big_free(j.blk);
+            if (file_mode) {
+                if (!j.keep_file) sceIoRemove(j.path);
+            } else {
+                big_free(j.blk);
+            }
             continue;
+        }
+
+
+        /* In file mode, the body still lives on disk — pull it into
+         * a MemBlock now (much later than the encode burst, so the
+         * one big contiguous allocation has the best chance of
+         * succeeding). */
+        int err = 0;
+        int rc;
+        if (file_mode) {
+            j.body = load_staging_file(j.path, j.len, &j.blk);
+            if (!j.body) {
+                /* Couldn't reserve memory or read the file. Treat as
+                 * a transient failure for notification purposes; the
+                 * staging file is unlinked either way. */
+                err = 0x80020004;  /* SCE_ERROR_ERRNO_ENOMEM-ish */
+                rc  = -2;
+                sceIoRemove(j.path);
+                if (j.notify) ps_progress_hide();
+                goto report;
+            }
         }
 
         if (j.notify) ps_progress_show("Uploading screenshot...");
 
-        int err = 0;
-        int rc = send_buffer(&cfg, j.body, j.len, &j.stamp, &err);
+        rc = send_buffer(&cfg, j.body, j.len, &j.stamp, &err);
 
         if (j.notify) ps_progress_hide();
+
+    report:
+
 
         /* Terminal feedback split by who asked for the upload:
          *
@@ -633,11 +801,18 @@ static int uploader_thread(SceSize args, void *argp) {
         }
 
         big_free(j.blk);
+        /* File-mode cleanup: only unlink staging files we own. The
+         * SceShell capture.png is shared (keep_file=1) — we leave it
+         * in place so SceShell's own bookkeeping isn't disturbed and
+         * the next screenshot just overwrites it. */
+        if (file_mode && j.path[0] && !j.keep_file) sceIoRemove(j.path);
+
     }
 
     vlog("uploader thread exiting");
     return 0;
 }
+
 
 int ps_uploader_start(void) {
     if (g_thid >= 0) return 0;

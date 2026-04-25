@@ -22,63 +22,16 @@ void abort(void) {
 extern void *sce_paf_malloc(size_t sz);
 extern void  sce_paf_free(void *p);
 
-/* The encode hook runs on SceShell's UI thread while the user is
- * holding PS+Start. We want a copy of the final PNG in RAM so we can
- * pass it to the upload worker without re-reading the file from flash
- * (SceShell hasn't finished writing it yet, anyway). This growable
- * capture buffer is owned by ScePaf and filled incrementally inside
- * write_func. It lives across a single encode_type2() call only.
- *
- * We cap the buffer at PS_MAX_UPLOAD_SIZE and silently disable capture
- * above that threshold so we never OOM SceShell. */
-typedef struct {
-	unsigned char *buf;
-	int            len;
-	int            cap;
-	int            overflow;   /* set once we stopped growing */
-	int            enabled;    /* set per encode: 1 iff config exists */
-} capture_t;
-
-static capture_t g_cap;
-
-static void capture_reset(void) {
-	if (g_cap.buf) sce_paf_free(g_cap.buf);
-	g_cap.buf = 0;
-	g_cap.len = 0;
-	g_cap.cap = 0;
-	g_cap.overflow = 0;
-	g_cap.enabled = 0;
-}
-
-static void capture_append(const void *data, int len) {
-	if (!g_cap.enabled || g_cap.overflow || len <= 0) return;
-	if (g_cap.len + len > PS_MAX_UPLOAD_SIZE) {
-		g_cap.overflow = 1;
-		vlog("capture: over %d bytes, disabling", PS_MAX_UPLOAD_SIZE);
-		return;
-	}
-	if (g_cap.len + len > g_cap.cap) {
-		/* Grow geometrically. PS Vita screenshots are ~1 MB so 2x
-		 * from 64 KB gets us there in 4 realloc steps. */
-		int ncap = g_cap.cap ? g_cap.cap * 2 : 64 * 1024;
-		while (ncap < g_cap.len + len) ncap *= 2;
-
-		unsigned char *nb = sce_paf_malloc(ncap);
-		if (!nb) {
-			g_cap.overflow = 1;
-			vlog("capture: sce_paf_malloc(%d) failed", ncap);
-			return;
-		}
-		if (g_cap.buf) {
-			for (int i = 0; i < g_cap.len; i++) nb[i] = g_cap.buf[i];
-			sce_paf_free(g_cap.buf);
-		}
-		g_cap.buf = nb;
-		g_cap.cap = ncap;
-	}
-	for (int i = 0; i < len; i++) g_cap.buf[g_cap.len + i] = ((const unsigned char *)data)[i];
-	g_cap.len += len;
-}
+/* SceShell writes the just-encoded PNG to this path (we set it via
+ * taiInjectData below). The file persists across screenshots —
+ * SceShell happily leaves the previous capture lying around until
+ * the user takes a new one — so we can hand the path straight to
+ * the uploader thread instead of buffering the body in RAM or
+ * keeping our own copy on disk. This is the lowest-overhead path:
+ * no extra allocations during the encode burst (which used to fail
+ * with sce_paf_malloc(1048576) under games with high memory
+ * pressure), no duplicate megabytes on the user's memory card. */
+#define PS_SCESHELL_CAPTURE_PATH "ur0:temp/screenshot/capture.png"
 
 void *malloc(size_t sz) {
 	return sce_paf_malloc(sz);
@@ -170,12 +123,6 @@ void write_func(png_structp png_ptr, png_bytep data, png_size_t length) {
 	g_png_size += length;
 	actual_encode_args_t *args = png_get_io_ptr(png_ptr);
 	args->encode->vptr->append(args->encode, data, length);
-
-	/* Mirror the bytes into our own buffer so the uploader thread
-	 * can re-send them after SceShell finishes this encode call. We
-	 * don't want to re-read from ux0:picture/SCREENSHOT because
-	 * SceShell writes that file *after* this function returns. */
-	capture_append(data, (int)length);
 }
 
 enum {
@@ -189,6 +136,7 @@ int encode_type2(actual_encode_args_t *args) {
 	png_structp png_ptr = NULL;
 	png_infop info_ptr = NULL;
 	dimensions_t wh = {0};
+	int upload_enabled = 0;
 
 	encode_t *encode = args->encode;
 	picture_t *picture = args->picture;
@@ -197,10 +145,11 @@ int encode_type2(actual_encode_args_t *args) {
 		return ENCODE_ERROR;
 
 	g_png_size = 0;
-	/* Only mirror the PNG if the user has opted into uploads by
-	 * creating a config. Checked once up-front so write_func's hot
-	 * loop just tests one flag per chunk — no per-write stat()s. */
-	g_cap.enabled = ps_cfg_present();
+	/* Snapshot the user-opt-in flag once, up-front. We act on it at
+	 * the *end* of the encode (after SceShell has flushed the PNG
+	 * to capture.png), but we don't want a config edit mid-encode
+	 * to flip the behaviour halfway through. */
+	upload_enabled = ps_cfg_present();
 	picture->vptr->get_dimensions(&wh, picture);
 
 	png_ptr = png_create_write_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
@@ -241,19 +190,21 @@ int encode_type2(actual_encode_args_t *args) {
 
 	png_write_end(png_ptr, info_ptr);
 
-	/* Hand a copy of the PNG to the uploader worker. Safe to call
-	 * with a NULL/empty buffer — enqueue validates the length.
-	 * g_cap.enabled is false when the user hasn't configured uploads,
-	 * in which case the capture buffer is empty and we silently skip. */
-	if (g_cap.enabled && !g_cap.overflow && g_cap.len > 0) {
+	/* Hand SceShell's own capture.png to the uploader. SceShell
+	 * writes the encoded PNG to that path right after we return —
+	 * the worker thread polls for file size >= g_png_size before
+	 * reading. We pass the path *shared* (no unlink): SceShell
+	 * leaves the file in place across screenshots and the next
+	 * screenshot just overwrites it, so deleting it from under
+	 * SceShell would risk confusing its own bookkeeping. */
+	if (upload_enabled && g_png_size > 0) {
 		SceDateTime stamp;
 		sceRtcGetCurrentClockLocalTime(&stamp);
-		ps_uploader_enqueue(g_cap.buf, g_cap.len, &stamp);
+		ps_uploader_enqueue_file(PS_SCESHELL_CAPTURE_PATH,
+		                         (int)g_png_size, &stamp);
 	}
 
 cleanup:
-	capture_reset();
-
 	if (png_ptr || info_ptr)
 		png_destroy_write_struct(&png_ptr, &info_ptr);
 
@@ -279,7 +230,6 @@ int module_start() {
 	ps_uploader_start();
 
 	if (info.module_nid == 0x0552F692) { // 3.60 retail
-
 		// disable watermark
 		taiHookFunctionOffset(&watermark_hook, info.modid, 0, 0x247e00, 1, place_watermark_hook);
 
@@ -348,4 +298,3 @@ int module_stop() {
 	ps_uploader_stop();
 	return 0;
 }
-

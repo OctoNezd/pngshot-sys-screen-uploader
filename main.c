@@ -4,6 +4,7 @@
 #include <psp2/rtc.h>
 #include <psp2/io/fcntl.h>
 #include <psp2/io/stat.h>
+#include <psp2/sysmodule.h>
 
 #include <libpng16/png.h>
 
@@ -368,6 +369,77 @@ cleanup:
 	return g_png_size;
 }
 
+static tai_hook_ref_t sceSysmoduleLoadModuleInternalWithArgRef;
+static tai_hook_ref_t scePafToplevelGetTextRef;
+static SceUID         photos_paf_text_hook  = -1;
+static SceUID         photos_paf_load_hook  = -1;
+
+/* UTF-16LE replacement string for the "Send via email" menu entry.
+ * Allocated lazily once ScePaf is loaded so sce_paf_malloc is safe.
+ * Stored as uint16_t* (NOT wchar_t*) — see make_u16 comment. */
+static uint16_t *custom_warning = NULL;
+
+/* Log every distinct text-id we ever see so we can identify the right
+ * one if 0xB8CFCC45 turns out to be wrong on this firmware. Bounded
+ * ring; one-shot per id. */
+#define PS_TEXT_ID_LOG_MAX 64
+static uint32_t seen_text_ids[PS_TEXT_ID_LOG_MAX];
+static int      seen_text_ids_n = 0;
+
+static int seen_text_id(uint32_t id) {
+	for (int i = 0; i < seen_text_ids_n; i++)
+		if (seen_text_ids[i] == id) return 1;
+	if (seen_text_ids_n < PS_TEXT_ID_LOG_MAX)
+		seen_text_ids[seen_text_ids_n++] = id;
+	return 0;
+}
+
+static wchar_t *scePafToplevelGetTextPatched(void *a0, void *a1) {
+	if (a1) {
+		uint32_t id = *(uint32_t *)((char *)a1 + 0xC);
+		if (!seen_text_id(id))
+			vlog("paf_text: id=0x%08X", id);
+		if (id == 0xB8CFCC45 && custom_warning)
+			return (wchar_t *)custom_warning;
+	}
+
+	return TAI_CONTINUE(wchar_t *, scePafToplevelGetTextRef, a0, a1);
+}
+
+/* ScePaf strings are UTF-16LE (16-bit code units), but the toolchain's
+ * `wchar_t` is 32-bit on arm-vita-eabi — using it caused our string to
+ * appear truncated to its first character ("U") because the renderer
+ * walked u16 units and the high half of each u32 was 0. Build a real
+ * uint16_t buffer and cast at the boundary. */
+static uint16_t *make_u16(const char *ascii) {
+	int n = 0;
+	while (ascii[n]) n++;
+	uint16_t *w = sce_paf_malloc((n + 1) * sizeof(uint16_t));
+	if (!w) return NULL;
+	for (int i = 0; i < n; i++) w[i] = (unsigned char)ascii[i];
+	w[n] = 0;
+	return w;
+}
+
+static int sceSysmoduleLoadModuleInternalWithArgPatched(SceUInt32 id, SceSize args,
+                                                        void *argp, void *unk) {
+	int res = TAI_CONTINUE(int, sceSysmoduleLoadModuleInternalWithArgRef,
+	                       id, args, argp, unk);
+
+	if (res >= 0 && id == SCE_SYSMODULE_INTERNAL_PAF && photos_paf_text_hook < 0) {
+		if (!custom_warning)
+			custom_warning = make_u16("Upload to sys-screenuploader");
+
+		photos_paf_text_hook = taiHookFunctionImport(&scePafToplevelGetTextRef,
+			TAI_MAIN_MODULE, 0x4D9A9DD0, 0x19CEFDA7,
+			scePafToplevelGetTextPatched);
+		vlog("photos: paf loaded, GetText hook=0x%08X warn=%p",
+		     photos_paf_text_hook, custom_warning);
+	}
+
+	return res;
+}
+
 int module_start() {
 	tai_module_info_t info = {0};
 	info.size = sizeof(info);
@@ -446,6 +518,18 @@ int module_start() {
 		/* FUN_81075b0c lives at file offset 0x75b0c in the photos
 		 * app main eboot (load base 0x81000000). */
 		taiHookFunctionOffset(&photos_email_hook, info.modid, 0, 0x75b0c, 1, photos_send_email);
+
+		/* The "Send via email" label comes from scePafToplevelGetText
+		 * but ScePaf isn't loaded into the Photos app at module_start
+		 * time, so a direct import hook here would never bind. Instead
+		 * we hook sceSysmoduleLoadModuleInternalWithArg (which Photos
+		 * itself calls), and install the GetText hook the moment PAF
+		 * has finished loading — same trick CustomWarning uses. */
+		photos_paf_load_hook = taiHookFunctionImport(
+			&sceSysmoduleLoadModuleInternalWithArgRef,
+			TAI_MAIN_MODULE, 0x03FCF19D, 0xC3C26339,
+			sceSysmoduleLoadModuleInternalWithArgPatched);
+		vlog("photos: sysmodule-load hook=0x%08X", photos_paf_load_hook);
 	}
 
 	return 0;

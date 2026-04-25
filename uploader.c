@@ -149,6 +149,98 @@ void ps_notify(const char *text) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Progress dialog                                                    */
+/*                                                                    */
+/* SceMsgDialog `PROGRESS_BAR` mode with the only legal barType       */
+/* (PERCENTAGE = 0) gives us a no-button modal with a custom title    */
+/* and a percent bar underneath. We never advance the bar — leaving   */
+/* it at 0% with a "Uploading screenshot..." title is the closest     */
+/* user-mode equivalent of an indeterminate "please wait" widget.     */
+/* (Sony's SCE_MSG_DIALOG_SYSMSG_TYPE_WAIT is the proper indeter-     */
+/* minate spinner, but its message text is fixed to "Please wait."    */
+/* and not customisable.)                                             */
+/*                                                                    */
+/* Locking: shares g_dlg_mtx with ps_notify so a final-result dialog */
+/* can't race the still-up progress dialog. ps_progress_show acquires */
+/* the lock and *holds it* until ps_progress_hide releases it.        */
+/* ------------------------------------------------------------------ */
+
+static int s_progress_up = 0;
+
+void ps_progress_show(const char *text) {
+    if (!text) return;
+    notify_ensure();
+    if (g_dlg_mtx < 0) return;
+
+    sceKernelLockMutex(g_dlg_mtx, 1, NULL);
+    /* Belt-and-braces: if a previous progress dialog is somehow still
+     * marked active (e.g. caller forgot ps_progress_hide), drop it
+     * before raising a new one. */
+    if (s_progress_up) {
+        sceMsgDialogClose();
+        for (int i = 0; i < 200; i++) {
+            if (sceMsgDialogGetStatus() != SCE_COMMON_DIALOG_STATUS_RUNNING) break;
+            sceKernelDelayThread(16 * 1000);
+        }
+        sceMsgDialogTerm();
+        for (int i = 0; i < 200; i++) {
+            if (sceMsgDialogGetStatus() == SCE_COMMON_DIALOG_STATUS_NONE) break;
+            sceKernelDelayThread(16 * 1000);
+        }
+        s_progress_up = 0;
+    }
+
+    SceMsgDialogProgressBarParam pb;
+    ps_memset(&pb, 0, sizeof(pb));
+    /* The only valid `barType` is PERCENTAGE (0); other values fail
+     * with SCE_MSG_DIALOG_ERROR_PARAM (22). We never call
+     * sceMsgDialogProgressBarSetValue, so the bar stays at 0% — the
+     * dialog's title (`msg`) is what the user actually reads, and
+     * the static bar-at-0 is acceptable for an "in-progress" hint
+     * since the upload itself is opaque (sceHttpSendRequest is
+     * blocking and emits no progress callbacks). */
+    pb.barType = SCE_MSG_DIALOG_PROGRESSBAR_TYPE_PERCENTAGE;
+    pb.msg     = (const SceChar8 *)text;
+
+    SceMsgDialogParam param;
+    sceMsgDialogParamInit(&param);
+    param.mode             = SCE_MSG_DIALOG_MODE_PROGRESS_BAR;
+    param.progBarParam     = &pb;
+
+    int rc = sceMsgDialogInit(&param);
+    if (rc < 0) {
+        vlog("progress: MsgDialogInit 0x%08X", rc);
+        sceKernelUnlockMutex(g_dlg_mtx, 1);
+        return;
+    }
+    s_progress_up = 1;
+    /* Mutex stays locked until ps_progress_hide. */
+}
+
+void ps_progress_hide(void) {
+    if (g_dlg_mtx < 0) return;
+    if (!s_progress_up) {
+        /* Nothing to do, but make sure we don't leak the lock if the
+         * caller pairs hide() with a show() that was bypassed (e.g.
+         * MsgDialogInit failed). */
+        return;
+    }
+
+    sceMsgDialogClose();
+    for (int i = 0; i < 200; i++) {
+        if (sceMsgDialogGetStatus() != SCE_COMMON_DIALOG_STATUS_RUNNING) break;
+        sceKernelDelayThread(16 * 1000);
+    }
+    sceMsgDialogTerm();
+    for (int i = 0; i < 200; i++) {
+        if (sceMsgDialogGetStatus() == SCE_COMMON_DIALOG_STATUS_NONE) break;
+        sceKernelDelayThread(16 * 1000);
+    }
+    s_progress_up = 0;
+    sceKernelUnlockMutex(g_dlg_mtx, 1);
+}
+
+/* ------------------------------------------------------------------ */
 /* Queue                                                              */
 /* ------------------------------------------------------------------ */
 
@@ -298,16 +390,35 @@ static void url_with_filename(const char *tmpl, const char *fname,
  *    0 : upload succeeded.
  *   -1 : permanent failure (HTTP 4xx, bad URL, etc).
  *   -2 : transient failure (network down, 5xx, send/read error).
- */
+ *
+ * `*err_out`, on non-zero return, carries the most useful diagnostic
+ *  we have: a negative sce error (e.g. 0x80431064 from sceHttpSend
+ *  when Wi-Fi is asleep), or the HTTP status code if we got that far.
+ *  Callers surface it to the user via the failure notification text
+ *  so they can grep / report. */
 static int send_buffer(const ps_config_t *cfg,
                        const void *png_data, int png_len,
-                       const SceDateTime *stamp) {
+                       const SceDateTime *stamp,
+                       int *err_out) {
+    if (err_out) *err_out = 0;
     if (!cfg->enabled) return 0;
-    if (http_ensure() < 0) return -2;
+    if (http_ensure() < 0) {
+        if (err_out) *err_out = -1;
+        return -2;
+    }
     /* Give the network up to 15 s to come up (e.g. just woke from
      * standby) before giving up. */
     if (!net_wait_ready(15 * 1000 * 1000)) {
-        vlog("net not ready");
+        int state = 0;
+        sceNetCtlInetGetState(&state);
+        vlog("net not ready, state=%d", state);
+        /* No sce error to surface — fabricate something the user
+         * recognises as "network problem" without colliding with a
+         * real Sony code. The upper byte 0x8062 isn't allocated to
+         * any module on Vita; "0x80620000 | state" gives us a code
+         * whose low nibble identifies which net stage we got stuck
+         * at (0=disabled, 1=wifi up, 2=ip pending, 3=connected). */
+        if (err_out) *err_out = (int)(0x80620000u | (unsigned)(state & 0xFFFF));
         return -2;
     }
 
@@ -321,16 +432,28 @@ static int send_buffer(const ps_config_t *cfg,
     int rc = -1;
 
     tpl = sceHttpCreateTemplate("pngshot-ssu/1.0", 1, 1);
-    if (tpl < 0) { vlog("CreateTemplate 0x%08X", tpl); goto out; }
+    if (tpl < 0) {
+        vlog("CreateTemplate 0x%08X", tpl);
+        if (err_out) *err_out = tpl;
+        goto out;
+    }
 
     sceHttpsSetSslCallback(tpl, https_accept_all, NULL);
 
     conn = sceHttpCreateConnectionWithURL(tpl, url, 0);
-    if (conn < 0) { vlog("CreateConnection 0x%08X url=%s", conn, url); goto out; }
+    if (conn < 0) {
+        vlog("CreateConnection 0x%08X url=%s", conn, url);
+        if (err_out) *err_out = conn;
+        goto out;
+    }
 
     req = sceHttpCreateRequestWithURL(conn, 1 /* POST */, url,
                                       (unsigned long long)png_len);
-    if (req < 0) { vlog("CreateRequest 0x%08X", req); goto out; }
+    if (req < 0) {
+        vlog("CreateRequest 0x%08X", req);
+        if (err_out) *err_out = req;
+        goto out;
+    }
 
     sceHttpAddRequestHeader(req, "Content-Type", "image/png", 0);
     sceHttpAddRequestHeader(req, "Accept", "*/*", 0);
@@ -338,6 +461,7 @@ static int send_buffer(const ps_config_t *cfg,
     int send_rc = sceHttpSendRequest(req, (void *)png_data, (unsigned int)png_len);
     if (send_rc < 0) {
         vlog("SendRequest 0x%08X url=%s", send_rc, url);
+        if (err_out) *err_out = send_rc;
         rc = -2;   /* transient */
         goto out;
     }
@@ -363,10 +487,12 @@ static int send_buffer(const ps_config_t *cfg,
     } else if (status >= 500 || status == 408 || status == 429) {
         /* Server-side hiccup / rate-limit. */
         vlog("upload fail status=%d url=%s resp=%s", status, url, resp);
+        if (err_out) *err_out = status;
         rc = -2;
     } else {
         /* 4xx other than rate-limit: the config is probably wrong. */
         vlog("upload fail status=%d url=%s resp=%s", status, url, resp);
+        if (err_out) *err_out = status;
         rc = -1;
     }
 
@@ -462,7 +588,12 @@ static int uploader_thread(SceSize args, void *argp) {
             continue;
         }
 
-        int rc = send_buffer(&cfg, j.body, j.len, &j.stamp);
+        if (j.notify) ps_progress_show("Uploading screenshot...");
+
+        int err = 0;
+        int rc = send_buffer(&cfg, j.body, j.len, &j.stamp, &err);
+
+        if (j.notify) ps_progress_hide();
 
         /* Terminal feedback split by who asked for the upload:
          *
@@ -475,25 +606,25 @@ static int uploader_thread(SceSize args, void *argp) {
          *     (the user didn't ask for any UI). On failure, fire a
          *     SceShell toast with the sce-style error code so the
          *     user notices and can grep / report.
-         */
+         *
+         * The displayed code is `err` (sce error from sceHttp*/
+        /*  sceNet*, or HTTP status), not the internal rc, so it's   */
+        /*  immediately greppable against published error tables.    */
         if (j.notify) {
             if (rc == 0) {
                 ps_notify("Screenshot uploaded");
             } else {
-                /* err_code is the most useful diagnostic we can
-                 * surface — pass our internal rc through as a
-                 * stand-in if no HTTP-specific code is available. */
                 char msg[128];
                 ps_snprintf(msg, sizeof(msg),
                             "Screenshot upload failed (0x%08X)",
-                            (unsigned)rc);
+                            (unsigned)err);
                 ps_notify(msg);
             }
         } else if (rc != 0) {
             char msg[128];
             ps_snprintf(msg, sizeof(msg),
                         "Screenshot upload failed (0x%08X)",
-                        (unsigned)rc);
+                        (unsigned)err);
             ps_notify_shell(msg);
         }
 

@@ -98,6 +98,16 @@ void ps_uploader_stop(void);
  * our part. */
 void ps_notify(const char *text);
 
+/* Non-blocking progress (spinner-style) dialog. Used by the Photos
+ * upload path so the user sees something happen while the HTTP POST
+ * is in flight (a 1 MB screenshot over Vita Wi-Fi can take several
+ * seconds). `ps_progress_show` returns immediately after the dialog
+ * is queued; `ps_progress_hide` tears it down before we put up the
+ * final ps_notify() result dialog. Safe to call from a worker
+ * thread inside the same process where the dialog should appear. */
+void ps_progress_show(const char *text);
+void ps_progress_hide(void);
+
 /* Top-right toast bubble, fired through SceShell's *internal* notice
  * builders (Princess-of-Sleeping PoC). Only resolves from inside the
  * SceShell process; in any other process this is a silent no-op.

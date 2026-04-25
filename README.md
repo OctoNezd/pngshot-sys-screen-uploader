@@ -8,9 +8,34 @@ pngshot-ssu is a modification of pngshot which allows to make screenshots in png
 
 If you think you can make a better plugin yourself - please do! I know whatever claude wrote isnt perfect - for example adrenaline screenshots are often corrupted - but it seems to be inherited from pngshot itself. And screenshots arent particularly fast too - but it seems to be case with pngshot as well. 
 
-## Want-to-do
+## Notice for my fellow Russian RKN "enjoyers"
 
-- A small text pop-up about successful screenshots would be nice.
+Apparently uploading photos is now illegal, at least with my ISP. Without proxy uploads freeze:
+
+```bash
+curl -v "http://screenuploader.bakatrouble.me/upload/<TOKEN>/?filename=2026042517420500-00000000000000000000000000000000.png" --upload-file photo_2026-04-25_17-44-19.jpg -X POST                            
+* Host screenuploader.bakatrouble.me:80 was resolved.
+* IPv6: (none)
+* IPv4: 188.166.152.102
+*   Trying 188.166.152.102:80...
+* Established connection to screenuploader.bakatrouble.me (188.166.152.102 port 80) from 192.168.88.3 port 58630 
+* using HTTP/1.x
+> POST /upload/<TOKEN>/?filename=2026042517420500-00000000000000000000000000000000.png HTTP/1.1
+> Host: screenuploader.bakatrouble.me
+> User-Agent: curl/8.19.0
+> Accept: */*
+> Content-Length: 83543
+> 
+* upload completely sent off: 83543 bytes
+```
+
+So the only option for now is to run proxy OR you can use server somewhere outside of this place redirecting to bakatrouble's. Example caddyfile config for that:
+
+```Caddyfile
+:80 {
+reverse_proxy https://screenuploader.bakatrouble.me:443
+}
+```
 
 ## Features
 

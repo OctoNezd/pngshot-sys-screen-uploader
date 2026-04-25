@@ -46,6 +46,7 @@ jobs:
           export APP_VER=$(cat version.txt)
       - name: Draft Release
         uses: softprops/action-gh-release@v2
+        if: github.ref == 'refs/heads/master'
         with:
           draft: true
           tag_name: "${{ env.APP_VER }}"

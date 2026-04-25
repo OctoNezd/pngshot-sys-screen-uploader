@@ -4,7 +4,6 @@
 #include <psp2/rtc.h>
 #include <psp2/io/fcntl.h>
 #include <psp2/io/stat.h>
-#include <psp2/sysmodule.h>
 
 #include <libpng16/png.h>
 
@@ -92,7 +91,6 @@ void free(void *p) {
 //////
 
 tai_hook_ref_t watermark_hook, encode_hook, encode_type2_hook, reg_hook;
-tai_hook_ref_t photos_email_hook;
 
 int get_key_int(const char *dir, const char *file, int *out) {
 	if (strcmp(dir, "/CONFIG/PHOTO") == 0 && strcmp(file, "debug_screenshot") == 0) {
@@ -105,107 +103,6 @@ int get_key_int(const char *dir, const char *file, int *out) {
 
 int place_watermark_hook() {
 	return 0;
-}
-
-/* Photos app (NPXS10004) email-sender hook.
- *
- * Original FUN_81075b0c(undefined4 *param_1) builds an
- *   "email:send?to=&cc=&subject=...&body=...&attach=<path>"
- * URI and hands it to SceAppMgrUser_003C634F(0x20000, ...) which
- * launches the Email app. We hijack it: read the attached file off
- * disk and hand the bytes to our normal sys-screenuploader pipeline
- * instead. The original is *not* called → no Email app launch.
- *
- * Photos passes paths rooted at "photo0:/SCREENSHOT/...". photo0:
- * isn't a real partition userland code can sceIoOpen — internally it
- * resolves to ux0:picture (or the equivalent on internal storage).
- * Plain prefix swap to ux0:picture/ works for the cases we care
- * about (screenshots).
- *
- * param_1 is a pointer to a C-string pointer (the email format uses
- * `%s` with `*param_1` as the arg). */
-
-/* Translate "photo0:/<rest>" -> "ux0:/picture/<rest>" into `out`.
- * Returns 0 on success, -1 if input doesn't have the photo0: prefix
- * or won't fit. */
-static int photos_translate_path(const char *src, char *out, int out_cap) {
-	const char *photo_prefix = "photo0:";
-	const char *ux_prefix    = "ux0:/picture";
-	int pl = (int)ps_strlen(photo_prefix);
-	if (!src || sceClibStrncmp(src, photo_prefix, pl) != 0) return -1;
-	int needed = (int)ps_strlen(ux_prefix) + (int)ps_strlen(src + pl) + 1;
-	if (needed > out_cap) return -1;
-	ps_snprintf(out, out_cap, "%s%s", ux_prefix, src + pl);
-	return 0;
-}
-
-void photos_send_email(void *param_1) {
-	if (!param_1) {
-		vlog("photos_send_email: param_1=NULL");
-		return;
-	}
-	const char *attach = *(const char **)param_1;
-	vlog("photos_send_email: attach=%s", attach ? attach : "(null)");
-	if (!attach) return;
-
-	char path[512];
-	if (photos_translate_path(attach, path, sizeof(path)) < 0) {
-		vlog("photos: unrecognized path prefix, skipping: %s", attach);
-		return;
-	}
-	vlog("photos: translated -> %s", path);
-
-	/* Skip filesystem hit if user hasn't configured uploads yet. */
-	if (!ps_cfg_present()) {
-		vlog("photos: no config, skipping upload");
-		return;
-	}
-
-	SceUID fd = sceIoOpen(path, SCE_O_RDONLY, 0);
-	if (fd < 0) {
-		vlog("photos: sceIoOpen %s -> 0x%08X", path, fd);
-		return;
-	}
-	SceOff sz = sceIoLseek(fd, 0, SCE_SEEK_END);
-	sceIoLseek(fd, 0, SCE_SEEK_SET);
-	if (sz <= 0 || sz > PS_MAX_UPLOAD_SIZE) {
-		vlog("photos: bad size %lld for %s", (long long)sz, path);
-		sceIoClose(fd);
-		return;
-	}
-
-	void *buf = sce_paf_malloc((size_t)sz);
-	if (!buf) {
-		vlog("photos: malloc %lld failed", (long long)sz);
-		sceIoClose(fd);
-		return;
-	}
-	int total = 0;
-	while (total < (int)sz) {
-		int r = sceIoRead(fd, (char *)buf + total, (int)sz - total);
-		if (r <= 0) break;
-		total += r;
-	}
-	sceIoClose(fd);
-
-	if (total != (int)sz) {
-		vlog("photos: short read %d/%lld", total, (long long)sz);
-		sce_paf_free(buf);
-		return;
-	}
-
-	SceDateTime stamp;
-	sceRtcGetCurrentClockLocalTime(&stamp);
-	/* Photos path asks for a toast on completion so users get visual
-	 * confirmation their share went somewhere (the email-app launch
-	 * they'd normally see is suppressed by us). */
-	int qr = ps_uploader_enqueue_notify(buf, total, &stamp, 1);
-	vlog("photos: enqueue %s len=%d -> %d", path, total, qr);
-
-	sce_paf_free(buf);
-
-	/* Intentional: do NOT TAI_CONTINUE. We swallow the call so the
-	 * Email app isn't launched. */
 }
 
 int encode_screenshot(void **ss_arg1, unsigned unk) {
@@ -369,77 +266,6 @@ cleanup:
 	return g_png_size;
 }
 
-static tai_hook_ref_t sceSysmoduleLoadModuleInternalWithArgRef;
-static tai_hook_ref_t scePafToplevelGetTextRef;
-static SceUID         photos_paf_text_hook  = -1;
-static SceUID         photos_paf_load_hook  = -1;
-
-/* UTF-16LE replacement string for the "Send via email" menu entry.
- * Allocated lazily once ScePaf is loaded so sce_paf_malloc is safe.
- * Stored as uint16_t* (NOT wchar_t*) — see make_u16 comment. */
-static uint16_t *custom_warning = NULL;
-
-/* Log every distinct text-id we ever see so we can identify the right
- * one if 0xB8CFCC45 turns out to be wrong on this firmware. Bounded
- * ring; one-shot per id. */
-#define PS_TEXT_ID_LOG_MAX 64
-static uint32_t seen_text_ids[PS_TEXT_ID_LOG_MAX];
-static int      seen_text_ids_n = 0;
-
-static int seen_text_id(uint32_t id) {
-	for (int i = 0; i < seen_text_ids_n; i++)
-		if (seen_text_ids[i] == id) return 1;
-	if (seen_text_ids_n < PS_TEXT_ID_LOG_MAX)
-		seen_text_ids[seen_text_ids_n++] = id;
-	return 0;
-}
-
-static wchar_t *scePafToplevelGetTextPatched(void *a0, void *a1) {
-	if (a1) {
-		uint32_t id = *(uint32_t *)((char *)a1 + 0xC);
-		if (!seen_text_id(id))
-			vlog("paf_text: id=0x%08X", id);
-		if (id == 0xB8CFCC45 && custom_warning)
-			return (wchar_t *)custom_warning;
-	}
-
-	return TAI_CONTINUE(wchar_t *, scePafToplevelGetTextRef, a0, a1);
-}
-
-/* ScePaf strings are UTF-16LE (16-bit code units), but the toolchain's
- * `wchar_t` is 32-bit on arm-vita-eabi — using it caused our string to
- * appear truncated to its first character ("U") because the renderer
- * walked u16 units and the high half of each u32 was 0. Build a real
- * uint16_t buffer and cast at the boundary. */
-static uint16_t *make_u16(const char *ascii) {
-	int n = 0;
-	while (ascii[n]) n++;
-	uint16_t *w = sce_paf_malloc((n + 1) * sizeof(uint16_t));
-	if (!w) return NULL;
-	for (int i = 0; i < n; i++) w[i] = (unsigned char)ascii[i];
-	w[n] = 0;
-	return w;
-}
-
-static int sceSysmoduleLoadModuleInternalWithArgPatched(SceUInt32 id, SceSize args,
-                                                        void *argp, void *unk) {
-	int res = TAI_CONTINUE(int, sceSysmoduleLoadModuleInternalWithArgRef,
-	                       id, args, argp, unk);
-
-	if (res >= 0 && id == SCE_SYSMODULE_INTERNAL_PAF && photos_paf_text_hook < 0) {
-		if (!custom_warning)
-			custom_warning = make_u16("Upload to sys-screenuploader");
-
-		photos_paf_text_hook = taiHookFunctionImport(&scePafToplevelGetTextRef,
-			TAI_MAIN_MODULE, 0x4D9A9DD0, 0x19CEFDA7,
-			scePafToplevelGetTextPatched);
-		vlog("photos: paf loaded, GetText hook=0x%08X warn=%p",
-		     photos_paf_text_hook, custom_warning);
-	}
-
-	return res;
-}
-
 int module_start() {
 	tai_module_info_t info = {0};
 	info.size = sizeof(info);
@@ -508,28 +334,11 @@ int module_start() {
 		const char *path = "ur0:temp/screenshot/capture.png";
 		taiInjectData(info.modid, 0, 0x514df8, path, strlen(path) + 1);
 	} else {
-		/* Photos app (NPXS10004) — taiHEN config must load us under
-		 * NPXS10004 for this branch to ever run. We don't gate on a
-		 * specific module_nid yet because we only have one known
-		 * sample; log it so future firmwares are easy to identify. */
-		vlog("photos: main module nid=0x%08X modid=0x%X — hooking email send",
-		     info.module_nid, info.modid);
-
-		/* FUN_81075b0c lives at file offset 0x75b0c in the photos
-		 * app main eboot (load base 0x81000000). */
-		taiHookFunctionOffset(&photos_email_hook, info.modid, 0, 0x75b0c, 1, photos_send_email);
-
-		/* The "Send via email" label comes from scePafToplevelGetText
-		 * but ScePaf isn't loaded into the Photos app at module_start
-		 * time, so a direct import hook here would never bind. Instead
-		 * we hook sceSysmoduleLoadModuleInternalWithArg (which Photos
-		 * itself calls), and install the GetText hook the moment PAF
-		 * has finished loading — same trick CustomWarning uses. */
-		photos_paf_load_hook = taiHookFunctionImport(
-			&sceSysmoduleLoadModuleInternalWithArgRef,
-			TAI_MAIN_MODULE, 0x03FCF19D, 0xC3C26339,
-			sceSysmoduleLoadModuleInternalWithArgPatched);
-		vlog("photos: sysmodule-load hook=0x%08X", photos_paf_load_hook);
+		/* Anything that isn't SceShell — assume Photos app
+		 * (NPXS10004). taiHEN config must load us under
+		 * *NPXS10004 for this branch to ever run. All hooks
+		 * for the Photos process live in photos.c. */
+		ps_photos_init(&info);
 	}
 
 	return 0;

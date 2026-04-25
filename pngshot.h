@@ -34,6 +34,9 @@
 #include <psp2/kernel/clib.h>
 #include <psp2/rtc.h>
 
+
+
+
 /* Paths and tuning ----------------------------------------------------- */
 
 #define PS_DATA_DIR        "ux0:data/pngshot-ssu"
@@ -113,5 +116,14 @@ void ps_progress_hide(void);
  * SceShell process; in any other process this is a silent no-op.
  * Tap-action launches Photos (NPXS10004). */
 void ps_notify_shell(const char *text);
+
+/* Photos app (NPXS10004) hooks. Installs both the email-builder
+ * function-offset hook and the deferred scePafToplevelGetText import
+ * hook (the latter via sceSysmoduleLoadModuleInternalWithArg, since
+ * ScePaf isn't loaded into Photos until after module_start runs).
+ * `info` is a pointer to a tai_module_info_t for the Photos main
+ * module — typed as void* here so this header doesn't need to drag
+ * <taihen.h> into every translation unit. See photos.c. */
+void ps_photos_init(const void *info);
 
 #endif

@@ -22,6 +22,7 @@ add_executable(pngshot-ssu
   config.c
   uploader.c
   notify_sceshell.c
+  photos.c
 )
 
 

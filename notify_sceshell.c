@@ -164,13 +164,13 @@ void ps_notify_shell(const char *text) {
      *   [0xBC] body text
      *   [0xCC] target title id (launched on tap)
      *   [0xD8] launch argument
-     *   [0xFC] notification "kind" flag (0x10 = downloaded content)
+     *   [0xC8] no idea what this does, took it from vitadb downloader and without it app doesnt launch
      */
     s_set_utf8(&data[0x00], "NPXS10004", sceClibStrnlen("NPXS10004", 0x10));
-    s_set_utf8(&data[0x0C], "g00",       sceClibStrnlen("g00", 0x10));
+    s_set_utf8(&data[0x0C], "photos",       sceClibStrnlen("photos", 0x10));
 
     *(uint32_t *)(&data[0x28]) = 0x2;
-    data[0x2C] = 1;
+    data[0x2C] = 0x1;
 
     s_set_utf8(&data[0x30],
                "vs0:app/NPXS10004/sce_sys/icon0.png",
@@ -178,10 +178,8 @@ void ps_notify_shell(const char *text) {
 
     s_set_utf8(&data[0xBC], text, sceClibStrnlen(text, 0xFF));
     s_set_utf8(&data[0xCC], "NPXS10004", sceClibStrnlen("NPXS10004", 0x10));
-    s_set_utf8(&data[0xD8], "", 0);
-
-    *(uint32_t *)(&data[0xFC]) = 0x10;
-
+    s_set_utf8(&data[0xD8], "photo:browse?category=SCREENSHOT", sceClibStrnlen("photo:browse?category=ALL", 0x20));
+    *(uint32_t *)(&data[0xC8]) = 0x20000;
     s_lsdb_dispatch(data, 1);
     s_notice_clean(data);
 

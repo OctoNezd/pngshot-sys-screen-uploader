@@ -620,12 +620,16 @@ static int uploader_thread(SceSize args, void *argp) {
                             (unsigned)err);
                 ps_notify(msg);
             }
-        } else if (rc != 0) {
-            char msg[128];
-            ps_snprintf(msg, sizeof(msg),
-                        "Screenshot upload failed (0x%08X)",
-                        (unsigned)err);
-            ps_notify_shell(msg);
+        } else {
+            if (rc == 0) {
+                ps_notify_shell("Screenshot uploaded. Tap to view in gallery.");
+            } else {
+                char msg[128];
+                ps_snprintf(msg, sizeof(msg),
+                            "Screenshot upload failed. Err:(0x%08X).",
+                            (unsigned)err);
+                ps_notify_shell(msg);
+            } 
         }
 
         big_free(j.blk);

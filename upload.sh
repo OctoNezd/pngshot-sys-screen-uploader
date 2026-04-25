@@ -22,3 +22,5 @@ cd build
 upload_file pngshot-ssu.suprx ur0:tai/
 cd ..
 upload_file config.txt ux0:data/pngshot-ssu/
+sleep 1
+echo reboot | nc $FTP_SERVER 1338

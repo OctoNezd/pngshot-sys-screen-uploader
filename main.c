@@ -141,8 +141,17 @@ int encode_type2(actual_encode_args_t *args) {
 	encode_t *encode = args->encode;
 	picture_t *picture = args->picture;
 
-	if (!encode || !encode->vptr->is_buffer_init(encode) || !picture || !picture->vptr->get_type(picture))
+	/* Sanity-log the entry: this fires once per screenshot. If we
+	 * see "encode_type2 enter" but no enqueue lines after it, the
+	 * problem is either ps_cfg_present() returning 0 or the hot
+	 * loop bailing out via ENCODE_ERROR1 mid-frame. */
+	vlog("encode_type2 enter");
+
+	if (!encode || !encode->vptr->is_buffer_init(encode) || !picture || !picture->vptr->get_type(picture)) {
+		vlog("encode_type2: bad args, returning ENCODE_ERROR");
 		return ENCODE_ERROR;
+	}
+
 
 	g_png_size = 0;
 	/* Snapshot the user-opt-in flag once, up-front. We act on it at
@@ -200,8 +209,13 @@ int encode_type2(actual_encode_args_t *args) {
 	if (upload_enabled && g_png_size > 0) {
 		SceDateTime stamp;
 		sceRtcGetCurrentClockLocalTime(&stamp);
+		/* keep_file=1 (shared with SceShell), notify=0 (no toast on
+		 * success — encode hook is silent by design; failures fall
+		 * back to ps_notify_shell inside the worker). */
 		ps_uploader_enqueue_file(PS_SCESHELL_CAPTURE_PATH,
-		                         (int)g_png_size, &stamp);
+		                         (int)g_png_size, &stamp,
+		                         /*keep_file=*/1, /*notify=*/0);
+
 	}
 
 cleanup:

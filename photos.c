@@ -21,12 +21,14 @@
 #include <taihen.h>
 #include <psp2/sysmodule.h>
 #include <psp2/io/fcntl.h>
+#include <psp2/io/stat.h>
 #include <psp2/rtc.h>
 
 #include "pngshot.h"
 
 extern void *sce_paf_malloc(size_t sz);
 extern void  sce_paf_free(void *p);
+
 
 /* Hooks ---------------------------------------------------------------- */
 
@@ -100,49 +102,37 @@ static void photos_send_email(void *param_1) {
 		return;
 	}
 
-	SceUID fd = sceIoOpen(path, SCE_O_RDONLY, 0);
-	if (fd < 0) {
-		vlog("photos: sceIoOpen %s -> 0x%08X", path, fd);
+	/* Stat the photo for size — we don't read it here. The Photos
+	 * process partition (`ddrmain: NPXS10004`) is *tiny* (a handful
+	 * of MB free in practice), and double-buffering a 1 MB JPEG
+	 * (paf_malloc + MemBlock copy in enqueue_notify) was enough to
+	 * crash the process on the *second* upload. Hand the path to
+	 * the worker instead — the worker allocates a single MemBlock
+	 * of exactly file-size bytes, reads, sends, frees. Net cost:
+	 * one buffer instead of two. */
+	SceIoStat st;
+	ps_memset(&st, 0, sizeof(st));
+	if (sceIoGetstat(path, &st) < 0) {
+		vlog("photos: sceIoGetstat %s failed", path);
 		return;
 	}
-	SceOff sz = sceIoLseek(fd, 0, SCE_SEEK_END);
-	sceIoLseek(fd, 0, SCE_SEEK_SET);
+	SceOff sz = st.st_size;
 	if (sz <= 0 || sz > PS_MAX_UPLOAD_SIZE) {
 		vlog("photos: bad size %lld for %s", (long long)sz, path);
-		sceIoClose(fd);
-		return;
-	}
-
-	void *buf = sce_paf_malloc((size_t)sz);
-	if (!buf) {
-		vlog("photos: malloc %lld failed", (long long)sz);
-		sceIoClose(fd);
-		return;
-	}
-	int total = 0;
-	while (total < (int)sz) {
-		int r = sceIoRead(fd, (char *)buf + total, (int)sz - total);
-		if (r <= 0) break;
-		total += r;
-	}
-	sceIoClose(fd);
-
-	if (total != (int)sz) {
-		vlog("photos: short read %d/%lld", total, (long long)sz);
-		sce_paf_free(buf);
 		return;
 	}
 
 	SceDateTime stamp;
 	sceRtcGetCurrentClockLocalTime(&stamp);
-	/* notify=1 → toast on completion since we suppressed the
-	 * normal Email-app launch and the user otherwise gets no
-	 * visual confirmation. */
-	int qr = ps_uploader_enqueue_notify(buf, total, &stamp, 1);
-	vlog("photos: enqueue %s len=%d -> %d", path, total, qr);
-
-	sce_paf_free(buf);
+	/* keep_file=1: never unlink the user's photo (it's a real file
+	 * in their gallery, not a staging copy). notify=1: toast on
+	 * completion since we suppressed the normal Email-app launch
+	 * and the user otherwise gets no visual confirmation. */
+	int qr = ps_uploader_enqueue_file(path, (int)sz, &stamp,
+	                                  /*keep_file=*/1, /*notify=*/1);
+	vlog("photos: enqueue %s len=%lld -> %d", path, (long long)sz, qr);
 }
+
 
 /* scePafToplevelGetText hook. a1+0xC is the 32-bit id of the requested
  * label. Intercept "Send via email" (0xB8CFCC45) and substitute. */

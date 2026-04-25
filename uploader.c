@@ -405,8 +405,737 @@ static void url_with_filename(const char *tmpl, const char *fname,
 }
 
 /* ------------------------------------------------------------------ */
-/* Core HTTP POST                                                     */
+/* Streaming HTTP POST over a raw socket                              */
+/*                                                                    */
+/* sceHttp wants the whole request body in one contiguous buffer,    */
+/* which is unworkable from inside the Photos process — its          */
+/* `ddrmain: NPXS10004` partition is so small that a single 1 MB    */
+/* allocation crashes the second upload. We bypass sceHttp entirely  */
+/* for file-mode jobs and write a minimal HTTP/1.1 POST onto a raw   */
+/* sceNetSocket, looping the body through a fixed 32 KB scratch      */
+/* buffer pulled from disk. Total RAM = ~32 KB regardless of file    */
+/* size.                                                             */
+/*                                                                    */
+/* This deliberately does *not* support https://. TLS would require  */
+/* mbedTLS-class crypto we don't have a streaming primitive for, and */
+/* the user's config already prefers plain http (the Vita CA bundle  */
+/* predates Let's Encrypt anyway).                                   */
+/*                                                                    */
+/* Same return-code contract as send_buffer():                       */
+/*    0 : ok                                                          */
+/*   -1 : permanent failure                                          */
+/*   -2 : transient failure                                          */
 /* ------------------------------------------------------------------ */
+
+/* Tiny URL splitter — handles only http://host[:port][/path]. */
+static int parse_http_url(const char *url,
+                          char *host, int host_cap,
+                          char *path, int path_cap,
+                          int *port_out) {
+    const char *p = url;
+    if (sceClibStrncmp(p, "http://", 7) != 0) return -1;
+    p += 7;
+    /* host (until ':' / '/' / end) */
+    int hi = 0;
+    while (*p && *p != ':' && *p != '/' && hi < host_cap - 1) host[hi++] = *p++;
+    host[hi] = '\0';
+    if (hi == 0) return -1;
+    /* port */
+    int port = 80;
+    if (*p == ':') {
+        p++;
+        port = 0;
+        while (*p >= '0' && *p <= '9') { port = port * 10 + (*p - '0'); p++; }
+        if (port <= 0 || port > 65535) return -1;
+    }
+    *port_out = port;
+    /* path */
+    if (*p == '\0') {
+        path[0] = '/';
+        path[1] = '\0';
+    } else {
+        int pi = 0;
+        while (*p && pi < path_cap - 1) path[pi++] = *p++;
+        path[pi] = '\0';
+    }
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* System HTTP proxy lookup                                            */
+/*                                                                    */
+/* The Vita's connection profile (Settings → Network) lets the user   */
+/* configure an HTTP proxy. sceHttp honours that automatically;       */
+/* since we bypass sceHttp on the streaming path, we have to read     */
+/* the same NetCtl info ourselves and tunnel through it. We treat     */
+/* http_proxy_config != 0 as "proxy enabled" (the value is 1 = auto / */
+/* 2 = manual on retail; both surface usable host:port tuples).       */
+/*                                                                    */
+/* When a proxy is in effect, we still TCP-connect to the proxy       */
+/* host:port (instead of the upstream origin) and write a so-called   */
+/* "absolute-form" request line ("POST http://origin/path HTTP/1.1"  */
+/* with the proxy's Host header) — this is the classic forward-proxy */
+/* convention and what mitmproxy / Squid / etc. expect.               */
+/* ------------------------------------------------------------------ */
+typedef struct {
+    int  in_use;
+    char host[256];
+    int  port;
+} ps_proxy_t;
+
+static int proxy_lookup(ps_proxy_t *out) {
+    out->in_use = 0;
+    out->host[0] = '\0';
+    out->port = 0;
+
+    SceNetCtlInfo info;
+    ps_memset(&info, 0, sizeof(info));
+    if (sceNetCtlInetGetInfo(SCE_NETCTL_INFO_GET_HTTP_PROXY_CONFIG, &info) < 0)
+        return 0;
+    if (info.http_proxy_config == 0) return 0;   /* proxy disabled */
+
+    ps_memset(&info, 0, sizeof(info));
+    if (sceNetCtlInetGetInfo(SCE_NETCTL_INFO_GET_HTTP_PROXY_SERVER, &info) < 0)
+        return 0;
+    if (info.http_proxy_server[0] == '\0') return 0;
+
+    size_t n = ps_strlen(info.http_proxy_server);
+    if (n >= sizeof(out->host)) n = sizeof(out->host) - 1;
+    ps_memcpy(out->host, info.http_proxy_server, n);
+    out->host[n] = '\0';
+
+    ps_memset(&info, 0, sizeof(info));
+    if (sceNetCtlInetGetInfo(SCE_NETCTL_INFO_GET_HTTP_PROXY_PORT, &info) < 0)
+        return 0;
+    out->port = (int)info.http_proxy_port;
+    if (out->port <= 0 || out->port > 65535) out->port = 8080; /* sane default */
+
+    out->in_use = 1;
+    vlog("proxy: using %s:%d", out->host, out->port);
+    return 1;
+}
+
+/* Resolve a hostname or accept a literal IPv4 string. Returns 0 on
+ * success and fills *out. */
+static int resolve_host(const char *host, SceNetInAddr *out) {
+
+    /* Try literal IP first. */
+    if (sceNetInetPton(SCE_NET_AF_INET, host, out) > 0) return 0;
+    /* Otherwise resolver. Pre-allocate a small workspace; ScePaf is
+     * fine here because the resolver itself is tiny. */
+    int rid = sceNetResolverCreate("pngshotssu_res", NULL, 0);
+    if (rid < 0) {
+        vlog("resolver create 0x%08X", rid);
+        return -1;
+    }
+    int rc = sceNetResolverStartNtoa(rid, host, out, 0, 0, 0);
+    sceNetResolverDestroy(rid);
+    if (rc < 0) {
+        vlog("resolver ntoa(%s) 0x%08X", host, rc);
+        return -1;
+    }
+    return 0;
+}
+
+/* Robust send: keeps calling sceNetSend until everything's out the
+ * socket or we hit an error. Handles EAGAIN/EWOULDBLOCK by yielding
+ * briefly and retrying — even though we set SNDTIMEO, sceNet has
+ * been observed returning SCE_NET_ERROR_EAGAIN (0x80410123) on the
+ * Vita's small kernel send buffer when the remote is slow to ACK,
+ * so we treat it as "back-pressure, try again" rather than fatal.
+ * Total wait per call is bounded by the SNDTIMEO we set when the
+ * socket was created (30 s); past that we give up. */
+static int net_send_all(int sock, const void *buf, int len) {
+    int sent = 0;
+    int retries = 0;
+    while (sent < len) {
+        int n = sceNetSend(sock, (const char *)buf + sent, len - sent, 0);
+        if (n > 0) {
+            sent += n;
+            retries = 0;
+            continue;
+        }
+        /* Errno-style payload lives in the low byte of the SCE_NET
+         * error code. 0x80410123 → errno 0x23 = EAGAIN. The kernel
+         * send buffer is full; the right move is to wait for ACKs
+         * to drain and retry. */
+        unsigned err = (unsigned)n;
+        int errno_ = err & 0xFFu;
+        if (n < 0 && (errno_ == 0x23 /* EAGAIN/EWOULDBLOCK */ ||
+                      errno_ == 0x04 /* EINTR */)) {
+            /* Cap total backoff at ~30 s (300 * 100 ms) so a peer
+             * that stops reading can't pin the worker thread. */
+            if (retries++ > 300) {
+                vlog("sceNetSend stalled after %d retries at %d/%d",
+                     retries, sent, len);
+                return -1;
+            }
+            sceKernelDelayThread(100 * 1000);
+            continue;
+        }
+        vlog("sceNetSend %d/%d -> 0x%08X", sent, len, (unsigned)n);
+        return -1;
+    }
+    return 0;
+}
+
+
+#define PS_STREAM_CHUNK   (32 * 1024)
+
+/* Read the file in PS_STREAM_CHUNK pieces and ship each one over the
+ * socket. We allocate the chunk buffer with sce_paf_malloc — it's
+ * small enough (32 KB) to fit even the tightest partition and there's
+ * no upside to reusing a static buffer when we expect at most a few
+ * uploads in flight. */
+static int net_send_file(int sock, const char *path, int len) {
+    SceUID fd = sceIoOpen(path, SCE_O_RDONLY, 0);
+    if (fd < 0) {
+        vlog("net_send_file: open %s 0x%08X", path, fd);
+        return -1;
+    }
+    /* Stack-resident scratch buffer. The uploader thread is started
+     * with a 0x20000 (128 KB) stack — 32 KB is well within budget,
+     * and keeping the buffer on-stack means we never touch ScePaf
+     * (which is pathologically tight inside the Photos process). */
+    static char chunk[PS_STREAM_CHUNK];
+    int sent = 0;
+    int rc = 0;
+    while (sent < len) {
+        int want = len - sent;
+        if (want > PS_STREAM_CHUNK) want = PS_STREAM_CHUNK;
+        int got = sceIoRead(fd, chunk, want);
+        if (got <= 0) { vlog("net_send_file: read short at %d", sent); rc = -1; break; }
+        if (net_send_all(sock, chunk, got) < 0) { rc = -1; break; }
+        sent += got;
+    }
+    sceIoClose(fd);
+    return rc;
+}
+
+
+/* Read the response status line, then walk through the headers,
+ * and finally capture the first chunk of the body into `body_buf`
+ * (NUL-terminated, truncated to body_cap-1). The body snippet is
+ * what we surface to the user and the log when the server returns
+ * a non-2xx status — sys-screenuploader's API typically returns
+ * a plain-text reason like "rate limit exceeded" or "image too
+ * big", and exposing that is far more useful than a bare status
+ * code.
+ *
+ *   status_out:    HTTP status code (e.g. 200, 413, 502)
+ *   body_buf/cap:  destination for first body bytes; cap >= 1
+ *
+ * Returns 0 on a parseable HTTP response (any status), or -1 if
+ * the response is malformed / connection broke before status.
+ *
+ * We pull bytes one at a time through sceNetRecv for the line-
+ * delimited prefix (status + headers); switching to bulk reads
+ * for the body. The status-line loop is fine to keep byte-by-byte
+ * — Vita has a TCP-level receive buffer in front of us, so this
+ * isn't actually one syscall per byte over the wire. */
+static int read_http_response(int sock, int *status_out,
+                              char *body_buf, int body_cap) {
+    if (body_cap > 0) body_buf[0] = '\0';
+
+    /* --- status line -------------------------------------------- */
+    char line[256];
+    int total = 0;
+    while (total < (int)sizeof(line) - 1) {
+        int n = sceNetRecv(sock, line + total, 1, 0);
+        if (n <= 0) {
+            vlog("read_http_response: recv %d at status-line byte %d",
+                 n, total);
+            return -1;
+        }
+        total += n;
+        if (total >= 2 && line[total - 2] == '\r' && line[total - 1] == '\n')
+            break;
+    }
+    line[total] = '\0';
+
+    /* "HTTP/1.x SSS Reason\r\n" — locate the status code. */
+    int sp = 0;
+    while (line[sp] && line[sp] != ' ') sp++;
+    if (!line[sp]) return -1;
+    int code = 0;
+    sp++;
+    while (line[sp] >= '0' && line[sp] <= '9') {
+        code = code * 10 + (line[sp] - '0');
+        sp++;
+    }
+    if (code <= 0) return -1;
+    *status_out = code;
+
+    /* --- headers ------------------------------------------------ */
+    /* Walk header lines until we hit a blank line. Track
+     * Content-Length so we know how much body to pull (capped at
+     * body_cap-1; we drop the rest on the floor). Other headers are
+     * ignored; we already asked for "Connection: close" so we don't
+     * need to honour Transfer-Encoding either. */
+    int content_length = -1;
+    for (;;) {
+        total = 0;
+        while (total < (int)sizeof(line) - 1) {
+            int n = sceNetRecv(sock, line + total, 1, 0);
+            if (n <= 0) {
+                /* No more data — this is fine for very short error
+                 * responses that hang up immediately. We just won't
+                 * have a body to show. */
+                return 0;
+            }
+            total += n;
+            if (total >= 2 && line[total - 2] == '\r' && line[total - 1] == '\n')
+                break;
+        }
+        line[total] = '\0';
+
+        /* End-of-headers marker (a bare CRLF). */
+        if (total <= 2) break;
+
+        /* Case-insensitive match on "Content-Length:". */
+        const char *cl = "content-length:";
+        int i = 0;
+        while (cl[i] && line[i]) {
+            char a = line[i]; if (a >= 'A' && a <= 'Z') a += 32;
+            if (a != cl[i]) break;
+            i++;
+        }
+        if (!cl[i]) {
+            /* Skip whitespace, parse decimal. */
+            int p = i;
+            while (line[p] == ' ' || line[p] == '\t') p++;
+            int v = 0;
+            while (line[p] >= '0' && line[p] <= '9') {
+                v = v * 10 + (line[p] - '0');
+                p++;
+            }
+            content_length = v;
+        }
+    }
+
+    /* --- body snippet ------------------------------------------- */
+    if (body_cap <= 1) return 0;
+    int want = content_length >= 0 ? content_length : (body_cap - 1);
+    if (want > body_cap - 1) want = body_cap - 1;
+    int got = 0;
+    while (got < want) {
+        int n = sceNetRecv(sock, body_buf + got, want - got, 0);
+        if (n <= 0) break;
+        got += n;
+    }
+    body_buf[got] = '\0';
+
+    /* Strip trailing whitespace / CRLF for cleaner log + UI. */
+    while (got > 0 && (body_buf[got - 1] == '\r' || body_buf[got - 1] == '\n' ||
+                       body_buf[got - 1] == ' '  || body_buf[got - 1] == '\t')) {
+        body_buf[--got] = '\0';
+    }
+    return 0;
+}
+
+
+/* ------------------------------------------------------------------ */
+/* JSON status check                                                   */
+/*                                                                    */
+/* sys-screenuploader's API always returns HTTP 200 — successes and   */
+/* failures alike are signalled in the JSON body:                     */
+/*                                                                    */
+/*   ok:    {"status":"ok"}                                           */
+/*   fail:  {"status":"error","message":"invalid image file"}         */
+/*                                                                    */
+/* So even though the transport-level status code is fine, we still   */
+/* have to peek inside the body to know if the upload actually        */
+/* worked. The parser is a deliberately tiny, allocation-free state   */
+/* machine: locate the *value* of a top-level string key, copy it     */
+/* (with minimal escape handling) into a caller buffer.               */
+/*                                                                    */
+/* This isn't a full JSON parser — it does *not* handle nested        */
+/* objects, comments, unicode escapes, or numeric values — but it's   */
+/* completely sufficient for screenuploader's flat reply shape, and   */
+/* any malformed body just falls through to "unknown error" handling. */
+/* ------------------------------------------------------------------ */
+static int json_field(const char *body, const char *key,
+                      char *out, int out_cap) {
+    if (out_cap > 0) out[0] = '\0';
+    /* Build the search needle as `"<key>"` so we don't false-match
+     * a substring of some other field. We accept any whitespace
+     * between the colon and the opening quote. */
+    char needle[64];
+    int kl = (int)ps_strlen(key);
+    if (kl + 3 > (int)sizeof(needle)) return -1;
+    needle[0] = '"';
+    ps_memcpy(needle + 1, key, kl);
+    needle[1 + kl] = '"';
+    needle[2 + kl] = '\0';
+
+    const char *p = ps_strstr(body, needle);
+    if (!p) return -1;
+    p += ps_strlen(needle);
+    /* Skip whitespace + the colon. */
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+    if (*p != ':') return -1;
+    p++;
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+    if (*p != '"') return -1;        /* only string values supported */
+    p++;
+
+    /* Copy chars until the closing quote, decoding the handful of
+     * escape sequences we expect to see in error messages. Stops
+     * cleanly on truncation. */
+    int oi = 0;
+    while (*p && *p != '"' && oi < out_cap - 1) {
+        if (*p == '\\' && p[1]) {
+            char esc = p[1];
+            char dec = esc;
+            if      (esc == 'n')  dec = '\n';
+            else if (esc == 't')  dec = '\t';
+            else if (esc == 'r')  dec = '\r';
+            else if (esc == '"')  dec = '"';
+            else if (esc == '\\') dec = '\\';
+            else if (esc == '/')  dec = '/';
+            /* Anything else (including \uXXXX) we just pass the
+             * literal escape character through; not perfect but
+             * fine for a one-line user toast. */
+            out[oi++] = dec;
+            p += 2;
+            continue;
+        }
+        out[oi++] = *p++;
+    }
+    out[oi] = '\0';
+    return 0;
+}
+
+/* `resp_out`/`resp_cap` (optional, may be NULL/0) receives a NUL-
+ * terminated snippet of the HTTP response body, useful for showing
+ * the server's human-readable error reason in the user toast. */
+
+static int send_file_streamed(const ps_config_t *cfg,
+                              const char *body_path, int body_len,
+                              const SceDateTime *stamp,
+                              int *err_out,
+                              char *resp_out, int resp_cap) {
+
+    if (err_out) *err_out = 0;
+    if (!cfg->enabled) return 0;
+    vlog("stream: begin path=%s len=%d", body_path, body_len);
+
+    /* Make sure libSceNet (and its dependencies) are loaded into our
+     * process. SceShell already did this for its own sceHttp use,
+     * but we still need sceHttpInit to set up the memory pool that
+     * sceNetSocket/sceNetResolver* use under the hood. http_ensure
+     * is idempotent and cheap when already-initialised. */
+    if (http_ensure() < 0) {
+        vlog("stream: http_ensure failed");
+        if (err_out) *err_out = -1;
+        return -2;
+    }
+
+    vlog("stream: net_wait_ready");
+    /* Net stack readiness — same 15 s budget as the sceHttp path. */
+    if (!net_wait_ready(15 * 1000 * 1000)) {
+
+        int state = 0;
+        sceNetCtlInetGetState(&state);
+        vlog("net not ready, state=%d", state);
+        if (err_out) *err_out = (int)(0x80620000u | (unsigned)(state & 0xFFFF));
+        return -2;
+    }
+
+    /* Synthesise the {filename}-expanded URL just like the sceHttp
+     * sender does. */
+    char fname[64];
+    synth_filename(stamp, fname);
+    char url[1024];
+    url_with_filename(cfg->upload_url, fname, url, sizeof(url));
+    vlog("stream: url=%s", url);
+
+    /* https:// is intentionally unsupported — see comment above. */
+    if (sceClibStrncmp(url, "https://", 8) == 0) {
+        vlog("stream: https not supported, please use http://");
+        if (err_out) *err_out = (int)0x80620100u;
+        return -1;
+    }
+
+    char origin_host[256], req_path[1024];
+    int origin_port = 80;
+    if (parse_http_url(url, origin_host, sizeof(origin_host),
+                       req_path, sizeof(req_path), &origin_port) < 0) {
+        vlog("stream: bad URL %s", url);
+        if (err_out) *err_out = (int)0x80620101u;
+        return -1;
+    }
+    vlog("stream: parsed host=%s port=%d path=%s",
+         origin_host, origin_port, req_path);
+
+    /* If the user configured a system HTTP proxy in Settings →
+     * Network we tunnel through it (same as sceHttp does). The
+     * upstream URL & Host header still refer to the *origin* —
+     * proxies expect absolute-form request lines and the origin's
+     * Host header for routing/Vary cache keys. */
+    ps_proxy_t proxy;
+    proxy_lookup(&proxy);
+    const char *connect_host = proxy.in_use ? proxy.host    : origin_host;
+    int         connect_port = proxy.in_use ? proxy.port    : origin_port;
+
+    SceNetInAddr addr;
+    if (resolve_host(connect_host, &addr) < 0) {
+        if (err_out) *err_out = (int)0x80620102u;
+        return -2;
+    }
+    vlog("stream: resolved %s -> 0x%08X",
+         connect_host, (unsigned)addr.s_addr);
+
+    int sock = sceNetSocket("pngshotssu_s", SCE_NET_AF_INET,
+                            SCE_NET_SOCK_STREAM, 0);
+    if (sock < 0) {
+        vlog("sceNetSocket 0x%08X", sock);
+        if (err_out) *err_out = sock;
+        return -2;
+    }
+    vlog("stream: socket=%d", sock);
+
+
+    /* Bound the send/recv waits so a half-open socket can't hang the
+     * worker forever. 30 s is generous for a 1 MB upload over Vita
+     * Wi-Fi but small enough that the user notices a real failure. */
+    int tmo = 30 * 1000 * 1000;
+    sceNetSetsockopt(sock, SCE_NET_SOL_SOCKET, SCE_NET_SO_SNDTIMEO,
+                     &tmo, sizeof(tmo));
+    sceNetSetsockopt(sock, SCE_NET_SOL_SOCKET, SCE_NET_SO_RCVTIMEO,
+                     &tmo, sizeof(tmo));
+
+    /* Switch the socket to non-blocking *just for connect()*, so we
+     * can give up after PS_CONNECT_TIMEOUT_US instead of letting
+     * the kernel's TCP retransmit timer pin the worker for ~75 s
+     * — a real concern in censored / dropped-packet networks where
+     * SYNs go into a black hole. We watch for EPOLLOUT (or
+     * EPOLLHUP/EPOLLERR for refused) via epoll, then flip the
+     * socket back to blocking before send/recv so the rest of the
+     * code can keep using the simpler synchronous primitives. */
+    int nbio_on = 1;
+    sceNetSetsockopt(sock, SCE_NET_SOL_SOCKET, SCE_NET_SO_NBIO,
+                     &nbio_on, sizeof(nbio_on));
+
+    SceNetSockaddrIn sin;
+    ps_memset(&sin, 0, sizeof(sin));
+    sin.sin_family = SCE_NET_AF_INET;
+    sin.sin_port   = sceNetHtons((unsigned short)connect_port);
+    sin.sin_addr   = addr;
+
+    vlog("stream: connecting to %s:%d%s (sin_addr=0x%08X net-order)",
+         connect_host, connect_port,
+         proxy.in_use ? " [via proxy]" : "",
+         (unsigned)sin.sin_addr.s_addr);
+    int cn = sceNetConnect(sock, (SceNetSockaddr *)&sin, sizeof(sin));
+    /* Non-blocking connect on Vita returns SCE_NET_ERROR_EINPROGRESS
+     * encoded as `0x80410100 | errno`. The errno here is 0x24
+     * (BSD-style EINPROGRESS), so the full code is 0x80410124 — not
+     * the 0x80410115 (errno 0x15 = ENOTSOCK on BSD) we initially
+     * guarded against. We accept the EINPROGRESS code explicitly,
+     * and as a belt-and-braces fallback we also accept any sceNet
+     * error whose low byte is 0x24, since some SDK headers / future
+     * firmwares may shift the upper bits. Anything else negative
+     * is a real fault. */
+    int conn_in_progress = (cn < 0) &&
+        (((unsigned)cn == 0x80410124u) ||
+         (((unsigned)cn & 0xFFFFFF00u) == 0x80410100u && ((unsigned)cn & 0xFFu) == 0x24));
+    if (cn < 0 && !conn_in_progress) {
+        vlog("sceNetConnect %s:%d 0x%08X", connect_host, connect_port, cn);
+        sceNetSocketClose(sock);
+        if (err_out) *err_out = cn;
+        return -2;
+    }
+
+    if (cn < 0) {
+        /* In-progress: wait for writable (or error) with a bounded
+         * timeout. */
+        int eid = sceNetEpollCreate("pngshotssu_ep", 0);
+        if (eid < 0) {
+            vlog("sceNetEpollCreate 0x%08X", eid);
+            sceNetSocketClose(sock);
+            if (err_out) *err_out = eid;
+            return -2;
+        }
+        SceNetEpollEvent ev;
+        ps_memset(&ev, 0, sizeof(ev));
+        ev.events  = SCE_NET_EPOLLOUT;
+        ev.data.fd = sock;
+        sceNetEpollControl(eid, SCE_NET_EPOLL_CTL_ADD, sock, &ev);
+        SceNetEpollEvent got;
+        ps_memset(&got, 0, sizeof(got));
+        /* sceNet uses a *milliseconds* timeout here, unlike
+         * sceKernelDelayThread's microseconds. PS_CONNECT_TIMEOUT_MS
+         * is intentionally short (15 s) so the user gets a quick
+         * failure dialog when censorship / firewall is dropping the
+         * SYN. */
+        int er = sceNetEpollWait(eid, &got, 1, 15 * 1000 /* ms */);
+        sceNetEpollDestroy(eid);
+        if (er <= 0) {
+            vlog("connect timed out after 15 s (host=%s port=%d)",
+                 connect_host, connect_port);
+            sceNetSocketClose(sock);
+            if (err_out) *err_out = (int)0x80620107u; /* synth: connect tmo */
+            return -2;
+        }
+        /* Confirm the actual connect outcome with SO_ERROR. */
+        int so_err = 0;
+        unsigned olen = sizeof(so_err);
+        sceNetGetsockopt(sock, SCE_NET_SOL_SOCKET, SCE_NET_SO_ERROR,
+                         &so_err, &olen);
+        if (so_err != 0) {
+            vlog("connect failed (SO_ERROR=0x%08X) host=%s port=%d",
+                 (unsigned)so_err, connect_host, connect_port);
+            sceNetSocketClose(sock);
+            if (err_out) *err_out = so_err;
+            return -2;
+        }
+    }
+    /* Success — flip back to blocking I/O for the simple send/recv
+     * code below. */
+    int nbio_off = 0;
+    sceNetSetsockopt(sock, SCE_NET_SOL_SOCKET, SCE_NET_SO_NBIO,
+                     &nbio_off, sizeof(nbio_off));
+    vlog("stream: connected, sending request");
+
+
+    /* Compose request line + headers. When proxying, RFC 7230 § 5.3.2
+     * wants an absolute-form target ("http://origin/path"); when
+     * direct, the origin form ("/path") is correct. The Host header
+     * always names the origin, regardless of which TCP endpoint we
+     * actually opened. */
+    char target[1280];
+    if (proxy.in_use) {
+        if (origin_port == 80) {
+            ps_snprintf(target, sizeof(target),
+                        "http://%s%s", origin_host, req_path);
+        } else {
+            ps_snprintf(target, sizeof(target),
+                        "http://%s:%d%s", origin_host, origin_port, req_path);
+        }
+    } else {
+        size_t n = ps_strlen(req_path);
+        if (n >= sizeof(target)) n = sizeof(target) - 1;
+        ps_memcpy(target, req_path, n);
+        target[n] = '\0';
+    }
+
+    /* Always include the explicit port in the Host header — RFC 7230
+     * allows it for any scheme, the server doesn't care, and it
+     * keeps the header construction branch-free. */
+    char hdr[1536];
+    int hl = ps_snprintf(hdr, sizeof(hdr),
+        "POST %s HTTP/1.1\r\n"
+        "Host: %s:%d\r\n"
+        "User-Agent: pngshot-ssu/1.0\r\n"
+        "Accept: */*\r\n"
+        "Content-Type: image/png\r\n"
+        "Content-Length: %d\r\n"
+        "Connection: close\r\n"
+        "\r\n",
+        target, origin_host, origin_port, body_len);
+
+
+    if (hl <= 0 || hl >= (int)sizeof(hdr)) {
+        sceNetSocketClose(sock);
+        if (err_out) *err_out = (int)0x80620103u;
+        return -1;
+    }
+
+    if (net_send_all(sock, hdr, hl) < 0) {
+        sceNetSocketClose(sock);
+        if (err_out) *err_out = (int)0x80620104u;
+        return -2;
+    }
+
+    if (net_send_file(sock, body_path, body_len) < 0) {
+        sceNetSocketClose(sock);
+        if (err_out) *err_out = (int)0x80620105u;
+        return -2;
+    }
+
+    int status = 0;
+    /* Local body buffer; we copy into the caller's resp_out below
+     * so the function still works when resp_out is NULL. 512 bytes
+     * is plenty for a server-side error reason — anything longer
+     * gets truncated, which is fine for a one-line user toast. */
+    char body[512];
+    if (read_http_response(sock, &status, body, sizeof(body)) < 0) {
+        sceNetSocketClose(sock);
+        if (err_out) *err_out = (int)0x80620106u;
+        return -2;
+    }
+
+    /* Drain whatever's left so the server sees a clean close even
+     * if the response body was longer than `body`. */
+    char drain[256];
+    for (int i = 0; i < 64; i++) {
+        int n = sceNetRecv(sock, drain, sizeof(drain), 0);
+        if (n <= 0) break;
+    }
+    sceNetSocketClose(sock);
+
+    /* Hand the body snippet back to the caller (truncated to fit). */
+    if (resp_out && resp_cap > 0) {
+        int bl = (int)ps_strlen(body);
+        if (bl > resp_cap - 1) bl = resp_cap - 1;
+        ps_memcpy(resp_out, body, bl);
+        resp_out[bl] = '\0';
+    }
+
+    if (status >= 200 && status < 300) {
+        /* sys-screenuploader signals failures *in the body* even on
+         * HTTP 200, so we have to look at the JSON `status` field
+         * before declaring success. Anything other than literal
+         * "ok" is treated as a permanent failure (no point retrying
+         * "invalid image file" — the file isn't going to fix itself
+         * on the next attempt). */
+        char ssu_status[32];
+        if (json_field(body, "status", ssu_status, sizeof(ssu_status)) == 0 &&
+            sceClibStrncmp(ssu_status, "ok", 3) != 0) {
+            char ssu_msg[160];
+            if (json_field(body, "message", ssu_msg, sizeof(ssu_msg)) != 0)
+                ssu_msg[0] = '\0';
+            vlog("stream upload app-fail status=\"%s\" message=\"%s\" body=%s",
+                 ssu_status, ssu_msg, body);
+            if (resp_out && resp_cap > 0) {
+                /* Replace the raw JSON we already copied with just
+                 * the human-readable reason, since that's what we
+                 * want to surface in the toast. */
+                const char *src = ssu_msg[0] ? ssu_msg : ssu_status;
+                int sl = (int)ps_strlen(src);
+                if (sl > resp_cap - 1) sl = resp_cap - 1;
+                ps_memcpy(resp_out, src, sl);
+                resp_out[sl] = '\0';
+            }
+            if (err_out) *err_out = (int)0x80620108u; /* synth: app-level */
+            return -1;
+        }
+        vlog("stream upload ok: %d bytes -> http://%s%s (HTTP %d)",
+             body_len, origin_host, req_path, status);
+        /* Wipe the response slot so the worker doesn't append a
+         * useless "{\"status\":\"ok\"}" to its success toast — but
+         * the worker already special-cases rc==0, so this is just
+         * future-proofing. */
+        if (resp_out && resp_cap > 0) resp_out[0] = '\0';
+        return 0;
+    }
+
+    if (err_out) *err_out = status;
+    if (status >= 500 || status == 408 || status == 429) {
+        vlog("stream upload fail status=%d body=%s", status, body);
+        return -2;
+    }
+    vlog("stream upload fail status=%d body=%s", status, body);
+    return -1;
+}
+
+
+
+/* ------------------------------------------------------------------ */
+/* Core HTTP POST (sceHttp, used by the in-RAM enqueue path)          */
+/* ------------------------------------------------------------------ */
+
 /* Return codes:
  *    0 : upload succeeded.
  *   -1 : permanent failure (HTTP 4xx, bad URL, etc).
@@ -582,7 +1311,8 @@ int ps_uploader_enqueue(const void *buf, int len, const SceDateTime *stamp) {
  * allocation thus happens *after* the encode burst, when SceShell's
  * memory pressure is at its lowest. */
 int ps_uploader_enqueue_file(const char *path, int len,
-                             const SceDateTime *stamp) {
+                             const SceDateTime *stamp,
+                             int keep_file, int notify) {
     if (!path || !path[0] || len <= 0 || len > PS_MAX_UPLOAD_SIZE) {
         vlog("enqueue_file: bad args path=%s len=%d", path ? path : "(null)", len);
         return -1;
@@ -600,15 +1330,12 @@ int ps_uploader_enqueue_file(const char *path, int len,
     }
 
     job_t *j = &g_ring[g_ring_tail];
-    j->blk      = -1;
-    j->body     = NULL;
-    j->len      = len;
-    j->notify   = 0;
-    /* The path is shared with SceShell (it's the same capture.png
-     * SceShell writes after every screenshot). Don't unlink it from
-     * under SceShell — the next screenshot just overwrites it, and
-     * removing it could confuse SceShell's own bookkeeping. */
-    j->keep_file = 1;
+    j->blk       = -1;
+    j->body      = NULL;
+    j->len       = len;
+    j->notify    = notify ? 1 : 0;
+    j->keep_file = keep_file ? 1 : 0;
+
     /* Bound-check + null-terminate. The path comes from main.c's
      * 128-byte staging-name builder, so this is just defensive. */
     size_t pl = ps_strlen(path);
@@ -633,61 +1360,27 @@ int ps_uploader_enqueue_file(const char *path, int len,
  * write entirely (e.g. user cancelled the screenshot). */
 static int wait_file_ready(const char *path, int expected) {
     SceIoStat st;
+    int last_size = -1;
     for (int i = 0; i < 100; i++) {
         ps_memset(&st, 0, sizeof(st));
-        if (sceIoGetstat(path, &st) >= 0 &&
-            (int)st.st_size >= expected) {
+        int gs = sceIoGetstat(path, &st);
+        if (gs >= 0) last_size = (int)st.st_size;
+        if (gs >= 0 && (int)st.st_size >= expected) {
             return 0;
         }
         sceKernelDelayThread(50 * 1000);
     }
+    vlog("wait_file_ready: %s timed out, last size=%d expected=%d",
+         path, last_size, expected);
     return -1;
 }
 
-/* Slurp a staging file into a freshly-allocated MemBlock. Returns
- * the buffer (and SceUID via *out_blk) on success, NULL on any
- * failure (alloc, open, short read). Caller frees on success. */
-static void *load_staging_file(const char *path, int len, SceUID *out_blk) {
-    *out_blk = -1;
 
-    /* SceShell writes capture.png *after* our encode hook returns,
-     * so the worker normally beats SceShell to the file. Block here
-     * until the on-disk size matches what the encoder reported, or
-     * give up after a few seconds. */
-    if (wait_file_ready(path, len) < 0) {
-        vlog("load_staging: %s did not reach %d bytes in time", path, len);
-        return NULL;
-    }
-
-    SceUID blk;
-    void *body = big_alloc((size_t)len, &blk);
-    if (!body) return NULL;
-
-    SceUID fd = sceIoOpen(path, SCE_O_RDONLY, 0);
-    if (fd < 0) {
-        vlog("load_staging: open %s failed 0x%08X", path, fd);
-        big_free(blk);
-        return NULL;
-    }
-
-
-    int total = 0;
-    while (total < len) {
-        int r = sceIoRead(fd, (char *)body + total, len - total);
-        if (r <= 0) {
-            vlog("load_staging: read %s short %d/%d (rc=%d)",
-                 path, total, len, r);
-            sceIoClose(fd);
-            big_free(blk);
-            return NULL;
-        }
-        total += r;
-    }
-    sceIoClose(fd);
-
-    *out_blk = blk;
-    return body;
-}
+/* (load_staging_file was removed: file-mode jobs now stream from
+ * disk directly via send_file_streamed instead of slurping the body
+ * into a 1 MB MemBlock. Kept the wait_file_ready helper since the
+ * worker still needs to wait for SceShell to finish writing
+ * capture.png before we open it.) */
 
 
 
@@ -719,11 +1412,15 @@ static int uploader_thread(SceSize args, void *argp) {
         g_ring_count--;
         sceKernelUnlockMutex(g_pipe_mtx, 1);
 
+        vlog("worker: dequeued job len=%d notify=%d path='%s'",
+             j.len, j.notify, j.path[0] ? j.path : "(none)");
+
         /* Re-read config on each attempt so toggling `enabled` or
          * swapping `upload_url` takes effect without a reboot. If the
          * user has disabled or removed the config since the shot was
          * queued, drop the buffer / file. */
         int file_mode = (j.path[0] != '\0');
+
         if (ps_cfg_load(&cfg) != 0 || !cfg.enabled) {
             if (file_mode) {
                 if (!j.keep_file) sceIoRemove(j.path);
@@ -734,33 +1431,50 @@ static int uploader_thread(SceSize args, void *argp) {
         }
 
 
-        /* In file mode, the body still lives on disk — pull it into
-         * a MemBlock now (much later than the encode burst, so the
-         * one big contiguous allocation has the best chance of
-         * succeeding). */
+        /* Two upload paths:
+         *   - file_mode: stream straight from disk over a raw
+         *     socket, ~32 KB scratch RAM regardless of body size.
+         *     This is what every real screenshot/share goes through
+         *     today; it's the only path that's safe inside the
+         *     Photos partition.
+         *   - in-RAM: legacy sceHttp path kept for the
+         *     ps_uploader_enqueue() API. Not used by anything
+         *     in-tree anymore but the symbol stays exported. */
         int err = 0;
         int rc;
+        /* Server-side error reason buffer. Both the streaming and
+         * sceHttp paths fill this with up to ~128 chars of the
+         * response body when the upload fails — sys-screenuploader
+         * hands back human-readable strings like "image too big"
+         * or "rate limit exceeded" that are far more actionable
+         * than a bare HTTP status code. Empty on success / when
+         * the server returned no body. */
+        char http_resp[160];
+        http_resp[0] = '\0';
         if (file_mode) {
-            j.body = load_staging_file(j.path, j.len, &j.blk);
-            if (!j.body) {
-                /* Couldn't reserve memory or read the file. Treat as
-                 * a transient failure for notification purposes; the
-                 * staging file is unlinked either way. */
-                err = 0x80020004;  /* SCE_ERROR_ERRNO_ENOMEM-ish */
+            /* Wait for the on-disk body to actually appear at the
+             * size we promised. SceShell flushes capture.png after
+             * encode_type2 returns, so the worker often races it. */
+            if (wait_file_ready(j.path, j.len) < 0) {
+                err = 0x80020004;
                 rc  = -2;
-                sceIoRemove(j.path);
+                if (!j.keep_file) sceIoRemove(j.path);
                 if (j.notify) ps_progress_hide();
                 goto report;
             }
+            if (j.notify) ps_progress_show("Uploading screenshot...");
+            rc = send_file_streamed(&cfg, j.path, j.len, &j.stamp, &err,
+                                    http_resp, sizeof(http_resp));
+            if (j.notify) ps_progress_hide();
+        } else {
+            if (j.notify) ps_progress_show("Uploading screenshot...");
+            rc = send_buffer(&cfg, j.body, j.len, &j.stamp, &err);
+            if (j.notify) ps_progress_hide();
         }
 
-        if (j.notify) ps_progress_show("Uploading screenshot...");
-
-        rc = send_buffer(&cfg, j.body, j.len, &j.stamp, &err);
-
-        if (j.notify) ps_progress_hide();
 
     report:
+
 
 
         /* Terminal feedback split by who asked for the upload:
@@ -778,27 +1492,45 @@ static int uploader_thread(SceSize args, void *argp) {
          * The displayed code is `err` (sce error from sceHttp*/
         /*  sceNet*, or HTTP status), not the internal rc, so it's   */
         /*  immediately greppable against published error tables.    */
+        /* Build a short single-line summary of the failure, with
+         * the server's reason string (if any) tacked on after the
+         * sce/HTTP error code. We trim the response to keep the
+         * toast readable — the full body is already in the log via
+         * vlog from inside the senders. */
         if (j.notify) {
             if (rc == 0) {
                 ps_notify("Screenshot uploaded");
             } else {
-                char msg[128];
-                ps_snprintf(msg, sizeof(msg),
-                            "Screenshot upload failed (0x%08X)",
-                            (unsigned)err);
+                char msg[256];
+                if (http_resp[0]) {
+                    ps_snprintf(msg, sizeof(msg),
+                                "Screenshot upload failed (0x%08X): %s",
+                                (unsigned)err, http_resp);
+                } else {
+                    ps_snprintf(msg, sizeof(msg),
+                                "Screenshot upload failed (0x%08X)",
+                                (unsigned)err);
+                }
                 ps_notify(msg);
             }
         } else {
             if (rc == 0) {
                 ps_notify_shell("Screenshot uploaded. Tap to view in gallery.");
             } else {
-                char msg[128];
-                ps_snprintf(msg, sizeof(msg),
-                            "Screenshot upload failed. Err:(0x%08X).",
-                            (unsigned)err);
+                char msg[256];
+                if (http_resp[0]) {
+                    ps_snprintf(msg, sizeof(msg),
+                                "Screenshot upload failed (0x%08X): %s",
+                                (unsigned)err, http_resp);
+                } else {
+                    ps_snprintf(msg, sizeof(msg),
+                                "Screenshot upload failed. Err:(0x%08X).",
+                                (unsigned)err);
+                }
                 ps_notify_shell(msg);
-            } 
+            }
         }
+
 
         big_free(j.blk);
         /* File-mode cleanup: only unlink staging files we own. The

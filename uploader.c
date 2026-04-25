@@ -26,6 +26,8 @@
 #include <psp2/sysmodule.h>
 #include <psp2/kernel/sysmem.h>
 #include <psp2/kernel/threadmgr.h>
+#include <psp2/message_dialog.h>
+#include <psp2/common_dialog.h>
 
 /* ------------------------------------------------------------------ */
 /* Dedicated MemBlock allocator for upload bodies. A Vita screenshot  */
@@ -51,6 +53,102 @@ static void *big_alloc(size_t size, SceUID *out_blk) {
 static void big_free(SceUID blk) { if (blk >= 0) sceKernelFreeMemBlock(blk); }
 
 /* ------------------------------------------------------------------ */
+/* User-feedback popup — implemented as SceMsgDialog.                 */
+/*                                                                    */
+/* The "right" mechanism would be sceNotificationUtilSendNotification  */
+/* (top-right trophy-style bubble), but Photos isn't on Sony's allow-  */
+/* list for that API: the call returns 0x80106301 INTERNAL no matter  */
+/* what init dance we do, and skipping init crashes the process.      */
+/*                                                                    */
+/* MsgDialog is a fallback that any foreground app can use, including */
+/* Photos — it's the same widget Photos uses for its own "Are you     */
+/* sure you want to delete?" prompts. It's modal (~1 s of UI block    */
+/* while user dismisses with X), but visible feedback for an upload   */
+/* that the user explicitly initiated via the Share menu is exactly   */
+/* what the task calls for.                                           */
+/*                                                                    */
+/* Render order:                                                      */
+/*   sceMsgDialogInit(USER_MSG, OK button, no extras) — pushes the    */
+/*   dialog onto Photos' commonDialog stack. Photos calls             */
+/*   sceCommonDialogUpdate() every frame, which actually renders our  */
+/*   dialog without us having to touch GXM.                           */
+/*                                                                    */
+/* We then poll sceMsgDialogGetStatus until FINISHED (user hit X) or  */
+/* a 30-second safety timeout, then sceMsgDialogTerm to release it.   */
+/*                                                                    */
+/* MsgDialog is single-instance per process, so we serialize calls    */
+/* on a tiny mutex — two back-to-back uploads' toasts won't stomp     */
+/* each other. */
+static int    g_dlg_inited = 0;
+static SceUID g_dlg_mtx    = -1;
+
+static void notify_ensure(void) {
+    if (g_dlg_inited) return;
+    g_dlg_mtx = sceKernelCreateMutex("pngshotssu_dlg", 0, 0, NULL);
+    g_dlg_inited = 1;
+}
+
+void ps_notify(const char *text) {
+    if (!text) return;
+    notify_ensure();
+    if (g_dlg_mtx < 0) return;
+
+    sceKernelLockMutex(g_dlg_mtx, 1, NULL);
+
+    SceMsgDialogUserMessageParam user;
+    ps_memset(&user, 0, sizeof(user));
+    user.buttonType = SCE_MSG_DIALOG_BUTTON_TYPE_OK;
+    user.msg        = (const SceChar8 *)text;
+
+    SceMsgDialogParam param;
+    sceMsgDialogParamInit(&param);
+    param.mode         = SCE_MSG_DIALOG_MODE_USER_MSG;
+    param.userMsgParam = &user;
+
+    int rc = sceMsgDialogInit(&param);
+    if (rc < 0) {
+        /* If MsgDialog is already up (another in-app prompt) this
+         * returns 0x80100A01. Not fatal — log and bail. */
+        vlog("notify: MsgDialogInit 0x%08X", rc);
+        sceKernelUnlockMutex(g_dlg_mtx, 1);
+        return;
+    }
+
+    /* Wait for the user to dismiss, with a hard cap so we never
+     * leak the dialog if Photos somehow stops calling
+     * sceCommonDialogUpdate. 30 s @ 30 ms = 1000 polls. */
+    for (int i = 0; i < 1000; i++) {
+        SceCommonDialogStatus st = sceMsgDialogGetStatus();
+        if (st == SCE_COMMON_DIALOG_STATUS_FINISHED) break;
+        sceKernelDelayThread(30 * 1000);
+    }
+    /* Per the SDK contract: a dialog whose status hit FINISHED must
+     * be transitioned to NONE before the next sceMsgDialogInit, or
+     * we get SCE_ERROR_ERRNO_EBUSY (0x80020401). The "Close →
+     * frame-tick → Term" sequence used by Sony's own samples works
+     * reliably: Close moves FINISHED → CLOSED, the next
+     * sceCommonDialogUpdate (driven by Photos) drains it, Term
+     * finally returns the slot to NONE. We then poll once more to
+     * confirm so the next caller sees a clean state. */
+    sceMsgDialogClose();
+    /* Give Photos' draw loop a couple of frames to actually flush. */
+    for (int i = 0; i < 200; i++) {
+        if (sceMsgDialogGetStatus() != SCE_COMMON_DIALOG_STATUS_RUNNING)
+            break;
+        sceKernelDelayThread(16 * 1000);   /* ~one frame at 60 Hz */
+    }
+    sceMsgDialogTerm();
+    /* And wait for the slot to actually go NONE. Belt-and-braces. */
+    for (int i = 0; i < 200; i++) {
+        if (sceMsgDialogGetStatus() == SCE_COMMON_DIALOG_STATUS_NONE)
+            break;
+        sceKernelDelayThread(16 * 1000);
+    }
+
+    sceKernelUnlockMutex(g_dlg_mtx, 1);
+}
+
+/* ------------------------------------------------------------------ */
 /* Queue                                                              */
 /* ------------------------------------------------------------------ */
 
@@ -59,6 +157,7 @@ typedef struct {
     void       *body;      /* base pointer inside blk */
     int         len;
     int         attempts;  /* how many times we've tried to send */
+    int         notify;    /* if non-zero: pop a toast on success/failure */
     SceDateTime stamp;     /* capture time, for filename synthesis */
 } job_t;
 
@@ -285,7 +384,8 @@ out:
 /* ------------------------------------------------------------------ */
 /* Public producer (called from the screenshot hook).                 */
 /* ------------------------------------------------------------------ */
-int ps_uploader_enqueue(const void *buf, int len, const SceDateTime *stamp) {
+int ps_uploader_enqueue_notify(const void *buf, int len,
+                               const SceDateTime *stamp, int notify) {
     if (len <= 0 || len > PS_MAX_UPLOAD_SIZE) {
         vlog("enqueue: bad len %d", len);
         return -1;
@@ -315,6 +415,7 @@ int ps_uploader_enqueue(const void *buf, int len, const SceDateTime *stamp) {
     j->body     = body;
     j->len      = len;
     j->attempts = 0;
+    j->notify   = notify ? 1 : 0;
     j->stamp    = *stamp;
     g_ring_tail = (g_ring_tail + 1) % PS_UPLOAD_QUEUE;
     g_ring_count++;
@@ -322,6 +423,10 @@ int ps_uploader_enqueue(const void *buf, int len, const SceDateTime *stamp) {
 
     sceKernelSignalSema(g_pipe_sem, 1);
     return 0;
+}
+
+int ps_uploader_enqueue(const void *buf, int len, const SceDateTime *stamp) {
+    return ps_uploader_enqueue_notify(buf, len, stamp, 0);
 }
 
 /* Re-insert a job at the head of the ring for another try. The ring
@@ -398,7 +503,24 @@ static int uploader_thread(SceSize args, void *argp) {
                 continue;
             }
             vlog("requeue failed (queue full); dropping");
-        } else if (rc == -2) {
+            /* Fall through to terminal failure path so the toast
+             * (if any) gets emitted, then the body is freed. */
+            rc = -2;
+        }
+
+        /* Terminal toast — only when caller asked (j.notify), and
+         * only on definite outcomes (not the requeue-and-continue
+         * case above, which `continue`d out of the loop). */
+        if (j.notify) {
+            if (rc == 0) {
+                ps_notify("Screenshot uploaded");
+            } else if (rc == -1) {
+                ps_notify("Upload failed (check config)");
+            } else { /* rc == -2 after exhausting retries */
+                ps_notify("Upload failed (network)");
+            }
+        }
+        if (rc == -2) {
             vlog("giving up after %d attempts", j.attempts);
         }
 

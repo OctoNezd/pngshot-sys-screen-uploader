@@ -45,6 +45,7 @@ target_link_libraries(pngshot-ssu
   SceSsl_stub_weak               # only for SCE_HTTPS_FLAG_* + the accept-all callback signature
   SceSysmodule_stub_weak
   SceRtc_stub_weak
+  SceCommonDialog_stub_weak      # SceMsgDialog used for upload-result popup
 )
 
 vita_create_self(pngshot-ssu.suprx pngshot-ssu CONFIG exports.yml UNSAFE)

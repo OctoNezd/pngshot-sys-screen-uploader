@@ -88,7 +88,19 @@ int  ps_cfg_present(void);
  * worker thread performs the HTTP POST. Returns 0 if queued. */
 int  ps_uploader_enqueue(const void *buf, int len, const SceDateTime *stamp);
 
+/* Same as ps_uploader_enqueue, but emits a system toast popup
+ * (success/failure) when the job finishes. Used by the photos-app
+ * email-hook path so users get visual feedback that their share
+ * actually went somewhere. `notify` is treated as a bool. */
+int  ps_uploader_enqueue_notify(const void *buf, int len,
+                                const SceDateTime *stamp, int notify);
+
 int  ps_uploader_start(void);
 void ps_uploader_stop(void);
+
+/* On-screen toast (top-right system notification, like trophy popups).
+ * Safe to call from any thread; the SceShell renders the bubble.
+ * `text` is plain ASCII; we'll widen it to UTF-16 internally. */
+void ps_notify(const char *text);
 
 #endif

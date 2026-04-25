@@ -45,9 +45,11 @@ reverse_proxy https://screenuploader.bakatrouble.me:443
 
 ## Installation
 
-Download from the [Releases section](https://github.com/octonezd/pngshot-ssu/releases).
+Download from the [Releases section](https://github.com/octonezd/pngshot-ssu/releases) or [CI](https://nightly.link/OctoNezd/pngshot-sys-screen-uploader/workflows/build.yaml/master).
 
-Copy `pngshot-ssu.suprx` to `ur0:tai` and add `ur0:tai/pngshot-ssu.suprx` below `*main` in `ur0:tai/config.txt`.
+Copy `pngshot-ssu.suprx` to `ur0:tai` and add `ur0:tai/pngshot-ssu.suprx` below `*main` in `ur0:tai/config.txt`. 
+
+IMPORTANT: Make sure to disable pngshot plugin. I didnt test them together, but I suppose they will conflict.
 
 If you also want the Photos app email hook to upload photos to ssu, add the plugin under `*NPXS10004` as well:
 

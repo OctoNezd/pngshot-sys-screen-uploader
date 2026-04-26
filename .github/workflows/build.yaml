@@ -15,7 +15,8 @@ jobs:
     runs-on: ubuntu-latest
     container: vitasdk/vitasdk:latest
     steps:
-      - uses: actions/checkout@v2
+      # originally taken from https://dev.to/frangarcj/handyvita-compiling-ps-vita-homebrew-with-github-actions-3k9, but it used a lot of outdated actions
+      - uses: actions/checkout@v6
       - name: prep for artifacts
         run: apk add nodejs
       - name: setup non-root for libpng
@@ -42,15 +43,16 @@ jobs:
           cd build
           make
       - name: Archive build artifacts
-        uses: actions/upload-artifact@v4
+        if: ${{ !env.ACT }} # broken, https://github.com/nektos/act/issues/6022
+        uses: actions/upload-artifact@v7
         with:
           path: build/pngshot-ssu.suprx
       - name: version variable
         run: |
           export APP_VER=$(cat version.txt)
       - name: Draft Release
-        uses: softprops/action-gh-release@v2
-        if: github.ref == 'refs/heads/master'
+        uses: softprops/action-gh-release@v3
+        if: ${{github.ref == 'refs/heads/master' && !env.ACT}}
         with:
           draft: true
           tag_name: "${{ env.APP_VER }}"

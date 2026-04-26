@@ -202,19 +202,18 @@ int encode_type2(actual_encode_args_t *args) {
 	/* Hand SceShell's own capture.png to the uploader. SceShell
 	 * writes the encoded PNG to that path right after we return —
 	 * the worker thread polls for file size >= g_png_size before
-	 * reading. We pass the path *shared* (no unlink): SceShell
-	 * leaves the file in place across screenshots and the next
-	 * screenshot just overwrites it, so deleting it from under
-	 * SceShell would risk confusing its own bookkeeping. */
+	 * reading. The uploader leaves the file in place; SceShell
+	 * keeps it across screenshots and overwrites it on the next
+	 * shot, so deleting it from under SceShell would risk
+	 * confusing its own bookkeeping. */
 	if (upload_enabled && g_png_size > 0) {
 		SceDateTime stamp;
 		sceRtcGetCurrentClockLocalTime(&stamp);
-		/* keep_file=1 (shared with SceShell), notify=0 (no toast on
-		 * success — encode hook is silent by design; failures fall
-		 * back to ps_notify_shell inside the worker). */
+		/* notify=0: encode hook is silent by design on success;
+		 * failures fall back to ps_notify_shell inside the worker. */
 		ps_uploader_enqueue_file(PS_SCESHELL_CAPTURE_PATH,
 		                         (int)g_png_size, &stamp,
-		                         /*keep_file=*/1, /*notify=*/0);
+		                         /*notify=*/0);
 
 	}
 

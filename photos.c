@@ -124,12 +124,11 @@ static void photos_send_email(void *param_1) {
 
 	SceDateTime stamp;
 	sceRtcGetCurrentClockLocalTime(&stamp);
-	/* keep_file=1: never unlink the user's photo (it's a real file
-	 * in their gallery, not a staging copy). notify=1: toast on
+	/* notify=1: toast on
 	 * completion since we suppressed the normal Email-app launch
 	 * and the user otherwise gets no visual confirmation. */
 	int qr = ps_uploader_enqueue_file(path, (int)sz, &stamp,
-	                                  /*keep_file=*/1, /*notify=*/1);
+	                                  /*notify=*/1);
 	vlog("photos: enqueue %s len=%lld -> %d", path, (long long)sz, qr);
 }
 

@@ -87,24 +87,24 @@ int  ps_uploader_enqueue(const void *buf, int len, const SceDateTime *stamp);
 
 /* On-disk variant: defer the big body allocation until the worker
  * actually wants to send. The worker stat()s the file, allocates a
- * MemBlock of exactly that size, slurps + POSTs, frees, and (unless
- * keep_file is set) unlinks the file.
+ * MemBlock of exactly that size, slurps + POSTs, frees. The file
+ * itself is always left in place — every current caller hands us a
+ * path it owns (SceShell's capture.png, the user's gallery photo)
+ * and doesn't want pngshot touching it.
  *
  * Used in two places:
  *   - SceShell encode hook: hands SceShell's own capture.png path
- *     (keep_file=1, notify=0) so the encode burst doesn't have to
- *     allocate a 1 MB buffer at exactly the moment ScePaf is most
- *     fragmented.
+ *     (notify=0) so the encode burst doesn't have to allocate a
+ *     1 MB buffer at exactly the moment ScePaf is most fragmented.
  *   - Photos share hook: hands the user's photo path directly
- *     (keep_file=1, notify=1) so the Photos process doesn't have
- *     to keep the file in ScePaf *and* a MemBlock at the same
- *     time — its tiny ddrmain partition can't hold both.
+ *     (notify=1) so the Photos process doesn't have to keep the
+ *     file in ScePaf *and* a MemBlock at the same time — its tiny
+ *     ddrmain partition can't hold both.
  *
- * Returns 0 if queued. On failure the caller is responsible for
- * cleaning up the file as appropriate. */
+ * Returns 0 if queued. */
 int  ps_uploader_enqueue_file(const char *path, int len,
                               const SceDateTime *stamp,
-                              int keep_file, int notify);
+                              int notify);
 
 
 

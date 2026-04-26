@@ -253,20 +253,19 @@ void ps_progress_hide(void) {
  *     and we copy it into our own MemBlock at enqueue time. `path`
  *     is empty.
  *
- *   on-disk (SceShell encode hook): the caller streamed the PNG
- *     into a staging file to keep memory pressure off the encode
- *     thread. `body`/`blk` start unset; the worker mmap-style-reads
- *     the file into a fresh MemBlock right before sending, so the
- *     one big allocation happens *after* the encode burst is over.
- *     The worker also unlinks the file when it's done.
+ *   on-disk (SceShell encode hook / Photos share): the caller hands
+ *     us a path it already owns. `body`/`blk` stay unset; the worker
+ *     streams the file directly off disk through a 32 KB scratch
+ *     buffer, so we never need a contiguous body allocation at all.
+ *     The file is left in place — every current caller's path is
+ *     either SceShell's persistent capture.png or the user's gallery
+ *     photo, neither of which we should be deleting.
  */
 typedef struct {
     SceUID      blk;       /* MemBlock holding the body, -1 for file mode */
     void       *body;      /* base pointer inside blk, NULL for file mode */
     int         len;
     int         notify;    /* if non-zero: pop a toast on success/failure */
-    int         keep_file; /* file mode: 1 = leave file alone (shared with
-                            *            SceShell), 0 = unlink after read */
     char        path[128]; /* staging file, empty string for in-RAM mode */
     SceDateTime stamp;     /* capture time, for filename synthesis */
 } job_t;
@@ -975,7 +974,7 @@ static int send_file_streamed(const ps_config_t *cfg,
             vlog("connect timed out after 15 s (host=%s port=%d)",
                  connect_host, connect_port);
             sceNetSocketClose(sock);
-            if (err_out) *err_out = (int)0x80620107u; /* synth: connect tmo */
+            if (err_out) *err_out = (int)0x80431068u; /* synth: connect tmo */
             return -2;
         }
         /* Confirm the actual connect outcome with SO_ERROR. */
@@ -1287,7 +1286,6 @@ int ps_uploader_enqueue_notify(const void *buf, int len,
     j->body      = body;
     j->len       = len;
     j->notify    = notify ? 1 : 0;
-    j->keep_file = 0;       /* in-RAM mode owns nothing on disk */
     j->path[0]   = '\0';
     j->stamp     = *stamp;
     g_ring_tail = (g_ring_tail + 1) % PS_UPLOAD_QUEUE;
@@ -1304,15 +1302,14 @@ int ps_uploader_enqueue(const void *buf, int len, const SceDateTime *stamp) {
 }
 
 /* File-mode enqueue: defer reading the PNG body until the worker
- * actually wants to send it. The job carries just the staging path
- * + expected length; the worker stat()s the file, allocates a single
+ * actually wants to send it. The job carries ju
  * MemBlock of exactly that size, slurps the bytes in, POSTs them,
  * frees the block, and unlinks the file. The expensive contiguous
  * allocation thus happens *after* the encode burst, when SceShell's
  * memory pressure is at its lowest. */
 int ps_uploader_enqueue_file(const char *path, int len,
                              const SceDateTime *stamp,
-                             int keep_file, int notify) {
+                             int notify) {
     if (!path || !path[0] || len <= 0 || len > PS_MAX_UPLOAD_SIZE) {
         vlog("enqueue_file: bad args path=%s len=%d", path ? path : "(null)", len);
         return -1;
@@ -1334,7 +1331,6 @@ int ps_uploader_enqueue_file(const char *path, int len,
     j->body      = NULL;
     j->len       = len;
     j->notify    = notify ? 1 : 0;
-    j->keep_file = keep_file ? 1 : 0;
 
     /* Bound-check + null-terminate. The path comes from main.c's
      * 128-byte staging-name builder, so this is just defensive. */
@@ -1422,11 +1418,11 @@ static int uploader_thread(SceSize args, void *argp) {
         int file_mode = (j.path[0] != '\0');
 
         if (ps_cfg_load(&cfg) != 0 || !cfg.enabled) {
-            if (file_mode) {
-                if (!j.keep_file) sceIoRemove(j.path);
-            } else {
-                big_free(j.blk);
-            }
+            /* File-mode jobs hand us a path the caller still owns
+             * (SceShell's capture.png, the user's gallery photo) —
+             * we never delete it. In-RAM mode owns its MemBlock and
+             * has to free it. */
+            if (!file_mode) big_free(j.blk);
             continue;
         }
 
@@ -1458,7 +1454,6 @@ static int uploader_thread(SceSize args, void *argp) {
             if (wait_file_ready(j.path, j.len) < 0) {
                 err = 0x80020004;
                 rc  = -2;
-                if (!j.keep_file) sceIoRemove(j.path);
                 if (j.notify) ps_progress_hide();
                 goto report;
             }
@@ -1532,12 +1527,9 @@ static int uploader_thread(SceSize args, void *argp) {
         }
 
 
-        big_free(j.blk);
-        /* File-mode cleanup: only unlink staging files we own. The
-         * SceShell capture.png is shared (keep_file=1) — we leave it
-         * in place so SceShell's own bookkeeping isn't disturbed and
-         * the next screenshot just overwrites it. */
-        if (file_mode && j.path[0] && !j.keep_file) sceIoRemove(j.path);
+        /* File-mode jobs don't allocate a MemBlock and don't own
+         * the path on disk — nothing to clean up. */
+        if (!file_mode) big_free(j.blk);
 
     }
 

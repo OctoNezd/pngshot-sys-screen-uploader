@@ -4,9 +4,9 @@ pngshot-ssu is a modification of pngshot which allows to make screenshots in png
 
 ## AI Disclaimer
 
-99% of changes are written by AI, particularly Claude Opus 4.7 using Cline plugin. The whole thing costed me like 30 bucks, but mostly cause I thought of idiotic implementation for first time. If you are not comfortable with using it cause of that - thats okay. 
+99% of changes are written by AI, particularly Claude Opus 4.7 using Cline plugin. The whole thing costed me like too much money by now, but mostly cause I thought of idiotic implementation for first time. If you are not comfortable with using it cause of that - thats okay. 
 
-If you think you can make a better plugin yourself - please do! I know whatever claude wrote isnt perfect - for example adrenaline screenshots are often corrupted - but it seems to be inherited from pngshot itself. And screenshots arent particularly fast too - but it seems to be case with pngshot as well. 
+If you think you can make a better plugin yourself - please do! I know whatever claude wrote isnt perfect - for example adrenaline screenshots are often corrupted if you switch back into livearea - but it seems to be inherited from pngshot itself. And screenshots arent particularly fast too - but it seems to be case with pngshot as well. 
 
 ## Notice for my fellow Russian RKN "enjoyers"
 
@@ -29,13 +29,33 @@ curl -v "http://screenuploader.bakatrouble.me/upload/<TOKEN>/?filename=202604251
 * upload completely sent off: 83543 bytes
 ```
 
-So the only option for now is to run proxy OR you can use server somewhere outside of this place redirecting to bakatrouble's. Example caddyfile config for that:
+So the only option for now is to run proxy OR you can use server somewhere outside of this place redirecting to bakatrouble's - but after some time they seem to block that as well, so I did it this way:
+
+- Caddyfile config for that:
 
 ```Caddyfile
 :80 {
 reverse_proxy https://screenuploader.bakatrouble.me:443
 }
 ```
+
+- And docker compose config on my home server that sets caddy to use http proxy:
+
+```compose
+  caddy:
+    image: caddy
+    container_name: caddy
+    restart: unless-stopped
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+    environment:
+      - http_proxy=http://192.168.88.15:1080
+      - https_proxy=http://192.168.88.15:1080
+```
+
+(I dont expose ports here cause my main home proxy is traefik, and I forward reverse proxy to reverse proxy which probably has reverse proxy in front of it. Yeah.)
+
+If you cant set proxy up yourself - feel free to dm me on Telegram or Discord and I will give you my proxy, but please dont spread it around for obvious reasons. Please set up your own proxy for yourself though if you can.
 
 ## Features
 
@@ -47,18 +67,19 @@ reverse_proxy https://screenuploader.bakatrouble.me:443
 
 Download from the [Releases section](https://github.com/octonezd/pngshot-ssu/releases) or [CI](https://nightly.link/OctoNezd/pngshot-sys-screen-uploader/workflows/build.yaml/master).
 
-Copy `pngshot-ssu.suprx` to `ur0:tai` and add `ur0:tai/pngshot-ssu.suprx` below `*main` in `ur0:tai/config.txt`. 
-
-IMPORTANT: Make sure to disable pngshot plugin. I didnt test them together, but I suppose they will conflict.
-
-If you also want the Photos app email hook to upload photos to ssu, add the plugin under `*NPXS10004` as well:
+Copy `pngshot-ssu.suprx` to `ur0:tai` and add this into your config.txt:
 
 ```
+# Upload screenshots from screenshot key
+*main
+ur0:tai/pngshot-ssu.suprx
+
+# Swaps send to email button logic with upload to ssu button
 *NPXS10004
 ur0:tai/pngshot-ssu.suprx
 ```
 
-Create ux0:data/pngshot-ssu directory. Write config.txt, based on contents of config.sample.txt in this repo.
+Create ux0:data/pngshot-ssu directory. Write config.txt, based on contents of [config.sample.txt](https://github.com/OctoNezd/pngshot-sys-screen-uploader/blob/master/config.sample.txt) in this repo.
 
 ## Usage
 

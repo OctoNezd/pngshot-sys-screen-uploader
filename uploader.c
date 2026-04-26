@@ -974,7 +974,7 @@ static int send_file_streamed(const ps_config_t *cfg,
             vlog("connect timed out after 15 s (host=%s port=%d)",
                  connect_host, connect_port);
             sceNetSocketClose(sock);
-            if (err_out) *err_out = (int)0x80431068u; /* synth: connect tmo */
+            if (err_out) *err_out = er; /* synth: connect tmo */
             return -2;
         }
         /* Confirm the actual connect outcome with SO_ERROR. */

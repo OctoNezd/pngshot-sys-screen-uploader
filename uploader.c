@@ -968,7 +968,7 @@ static int send_file_streamed(const ps_config_t *cfg,
          * is intentionally short (15 s) so the user gets a quick
          * failure dialog when censorship / firewall is dropping the
          * SYN. */
-        int er = sceNetEpollWait(eid, &got, 1, 15 * 1000 /* ms */);
+        int er = sceNetEpollWait(eid, &got, 1, 15 * 1000 * 1000 /* that mu things seconds, see https://discord.com/channels/439481392548675594/465960127963463680/1497936180170199041 */);
         sceNetEpollDestroy(eid);
         if (er <= 0) {
             vlog("connect timed out after 15 s (host=%s port=%d)",

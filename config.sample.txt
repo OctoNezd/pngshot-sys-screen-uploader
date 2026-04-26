@@ -10,10 +10,7 @@
 # sys-screenuploader filename  YYYYMMDDhhmmss00-<32×hex>.png  so your
 # server can use the same filename parsing as the stock Switch tool.
 #
-# Prefer plain http:// when possible. Modern https:// endpoints using
-# Let's Encrypt / ISRG Root X1 will fail the TLS handshake — the Vita
-# CA bundle predates that root. Self-signed / older CAs are accepted
-# (we register an accept-all SSL callback).
+# Use ONLY plaintext http - we use raw sockets
 
 upload_url = http://screenuploader.bakatrouble.me/upload/PUT_DEST_ID_HERE/?filename={filename}
 

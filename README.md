@@ -65,7 +65,7 @@ If you cant set proxy up yourself - feel free to dm me on Telegram or Discord an
 
 ## Installation
 
-Download from the [Releases section](https://github.com/octonezd/pngshot-ssu/releases) or [CI](https://nightly.link/OctoNezd/pngshot-sys-screen-uploader/workflows/build.yaml/master).
+Download from the [Releases section](https://github.com/OctoNezd/pngshot-sys-screen-uploader/releases) or [CI](https://nightly.link/OctoNezd/pngshot-sys-screen-uploader/workflows/build.yaml/master).
 
 Copy `pngshot-ssu.suprx` to `ur0:tai` and add this into your config.txt:
 

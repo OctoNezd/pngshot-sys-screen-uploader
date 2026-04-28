@@ -22,8 +22,8 @@ jobs:
           persist-credentials: false
       - name: disable safe directories
         run: git config --global --add safe.directory "*"
-      - name: prep for artifacts
-        run: apk add nodejs github-cli
+      - name: install necessary evil
+        run: apk add nodejs github-cli tar
       - name: setup non-root for libpng
         run: |
           adduser nonroot -D -H

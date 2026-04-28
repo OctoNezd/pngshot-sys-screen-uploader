@@ -29,12 +29,19 @@ jobs:
           echo permit nopass keepenv setenv { PATH } root as nonroot > /etc/doas.d/doas.conf
           echo $PATH
           ls -la /usr/local/vitasdk/bin
+      - name: Cache libpng
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae
+        with:
+          path: libpng/libpng-1.6.29-1-arm.tar.xz
       - name: build libpng
+        if: ${{ hashFiles('libpng/libpng-1.6.29-1-arm.tar.xz') != '' }}
         run: |
           chmod 777 libpng -R
           cd libpng
           doas -u nonroot env
           doas -u nonroot vita-makepkg
+      - name: install libpng
+        run: |
           vdpm libpng-1.6.29-1-arm.tar.xz
       - name: cmake
         run: |

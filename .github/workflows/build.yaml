@@ -4,11 +4,12 @@ on:
   push:
     paths-ignore:
       - "*.md"
-  pull_request:
-    paths-ignore:
-      - "*.md"
   repository_dispatch:
     types: [ run_build ]
+
+permissions:
+  artifact-metadata: write
+  contents: write
 
 jobs:
   build:
@@ -16,7 +17,9 @@ jobs:
     container: vitasdk/vitasdk:latest
     steps:
       # originally taken from https://dev.to/frangarcj/handyvita-compiling-ps-vita-homebrew-with-github-actions-3k9, but it used a lot of outdated actions
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
       - name: prep for artifacts
         run: apk add nodejs
       - name: setup non-root for libpng
@@ -44,18 +47,13 @@ jobs:
           make
       - name: Archive build artifacts
         if: ${{ !env.ACT }} # broken, https://github.com/nektos/act/issues/6022
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           path: build/pngshot-ssu.suprx
       - name: version variable
         run: |
           export APP_VER=$(cat version.txt)
       - name: Draft Release
-        uses: softprops/action-gh-release@v3
         if: ${{github.ref == 'refs/heads/master' && !env.ACT}}
-        with:
-          draft: true
-          tag_name: "${{ env.APP_VER }}"
-          files: build/pngshot-ssu.suprx
-
-# https://github.com/OctoNezd/VNDS-LOVE-TOUCH/blob/main/.github/workflows/main.yml
+        run: |
+          gh release create -d -t $APP_VER build/pngshot-ssu.suprx

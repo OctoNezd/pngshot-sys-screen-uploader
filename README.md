@@ -57,12 +57,6 @@ reverse_proxy https://screenuploader.bakatrouble.me:443
 
 If you cant set proxy up yourself - feel free to dm me on Telegram or Discord and I will give you my proxy, but please dont spread it around for obvious reasons. Please set up your own proxy for yourself though if you can.
 
-## Features
-
-* Takes screenshots in png format
-* No watermark
-* Take screenshots in any app
-
 ## Installation
 
 Download from the [Releases section](https://github.com/OctoNezd/pngshot-sys-screen-uploader/releases) or [CI](https://nightly.link/OctoNezd/pngshot-sys-screen-uploader/workflows/build.yaml/master).
@@ -87,7 +81,7 @@ Press PS button + Start to take a screenshot. You can access screenshots with th
 
 ## Additional notes
 
-To compile this plugin from source, you need a custom build of libpng (the one in vdpm will not work). Check out `libpng` directory for a working `VITABUILD`.
+To compile this plugin from source, you need a custom build of libpng (the one in vdpm will not work). Check out `libpng` directory for a working `VITABUILD` and .github/workflows/build.yaml for compiling
 
 ## Debugging
 

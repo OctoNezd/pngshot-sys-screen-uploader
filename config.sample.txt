@@ -5,6 +5,7 @@
 # `upload_url` is REQUIRED. It's the endpoint a sys-screenuploader-
 # compatible server listens on; pngshot-ssu will send a POST with
 # Content-Type: image/png and the raw PNG as the body.
+# You can get the upload URL destination id at https://screenuploader.bakatrouble.me/
 #
 # The special token `{filename}` is expanded to the synthesised
 # sys-screenuploader filename  YYYYMMDDhhmmss00-<32×hex>.png  so your

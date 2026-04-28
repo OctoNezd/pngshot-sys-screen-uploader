@@ -21,7 +21,7 @@ jobs:
         with:
           persist-credentials: false
       - name: prep for artifacts
-        run: apk add nodejs
+        run: apk add nodejs github-cli
       - name: setup non-root for libpng
         run: |
           adduser nonroot -D -H

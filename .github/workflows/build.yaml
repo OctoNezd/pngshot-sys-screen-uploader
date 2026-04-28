@@ -32,6 +32,7 @@ jobs:
       - name: Cache libpng
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae
         with:
+          key: libpng
           path: libpng/libpng-1.6.29-1-arm.tar.xz
       - name: build libpng
         if: ${{ hashFiles('libpng/libpng-1.6.29-1-arm.tar.xz') != '' }}

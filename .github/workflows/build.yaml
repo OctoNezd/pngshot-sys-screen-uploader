@@ -43,6 +43,7 @@ jobs:
           doas -u nonroot vita-makepkg
       - name: install libpng
         run: |
+          cd libpng
           vdpm libpng-1.6.29-1-arm.tar.xz
       - name: cmake
         run: |

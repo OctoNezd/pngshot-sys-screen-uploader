@@ -66,3 +66,5 @@ jobs:
         if: ${{github.ref == 'refs/heads/master' && !env.ACT}}
         run: |
           gh release create -d -t $APP_VER build/pngshot-ssu.suprx
+        env:
+          GH_TOKEN: ${{ github.token }}

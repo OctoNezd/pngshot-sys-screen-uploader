@@ -330,30 +330,6 @@ static int http_ensure(void) {
     return 0;
 }
 
-/* SceShell already brings the net stack up, but we may race it on
- * boot, or Wi-Fi may be asleep when the user takes a screenshot right
- * after waking from standby. Try to nudge it awake once per call and
- * then poll for up to `wait_us` microseconds. Return 1 when we see
- * state == 3 (SCE_NETCTL_STATE_CONNECTED). */
-static int net_wait_ready(unsigned wait_us) {
-    int state = 0;
-    unsigned waited = 0;
-    const unsigned step = 500 * 1000;  /* 500 ms poll */
-
-    /* Initial check: if we're already up, return immediately. */
-    if (sceNetCtlInetGetState(&state) >= 0 && state == 3) return 1;
-
-    /* sceNetCtlInetGetState returning >=0 with state != 3 means the
-     * stack is available but not connected. We can't programmatically
-     * re-associate to Wi-Fi from user-mode without triggering system
-     * UI, but polling gives the user / SceShell time to finish it. */
-    while (waited < wait_us) {
-        sceKernelDelayThread(step);
-        waited += step;
-        if (sceNetCtlInetGetState(&state) >= 0 && state == 3) return 1;
-    }
-    return 0;
-}
 
 /* ------------------------------------------------------------------ */
 /* sys-screenuploader filename synthesis                               */
@@ -830,17 +806,6 @@ static int send_file_streamed(const ps_config_t *cfg,
         return -2;
     }
 
-    vlog("stream: net_wait_ready");
-    /* Net stack readiness — same 15 s budget as the sceHttp path. */
-    if (!net_wait_ready(15 * 1000 * 1000)) {
-
-        int state = 0;
-        sceNetCtlInetGetState(&state);
-        vlog("net not ready, state=%d", state);
-        if (err_out) *err_out = (int)(0x80620000u | (unsigned)(state & 0xFFFF));
-        return -2;
-    }
-
     /* Synthesise the {filename}-expanded URL just like the sceHttp
      * sender does. */
     char fname[64];
@@ -1153,21 +1118,6 @@ static int send_buffer(const ps_config_t *cfg,
     if (!cfg->enabled) return 0;
     if (http_ensure() < 0) {
         if (err_out) *err_out = -1;
-        return -2;
-    }
-    /* Give the network up to 15 s to come up (e.g. just woke from
-     * standby) before giving up. */
-    if (!net_wait_ready(15 * 1000 * 1000)) {
-        int state = 0;
-        sceNetCtlInetGetState(&state);
-        vlog("net not ready, state=%d", state);
-        /* No sce error to surface — fabricate something the user
-         * recognises as "network problem" without colliding with a
-         * real Sony code. The upper byte 0x8062 isn't allocated to
-         * any module on Vita; "0x80620000 | state" gives us a code
-         * whose low nibble identifies which net stage we got stuck
-         * at (0=disabled, 1=wifi up, 2=ip pending, 3=connected). */
-        if (err_out) *err_out = (int)(0x80620000u | (unsigned)(state & 0xFFFF));
         return -2;
     }
 

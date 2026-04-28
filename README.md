@@ -2,6 +2,8 @@
 
 pngshot-ssu is a modification of pngshot which allows to make screenshots in png, and modification is that screenshots are sent to telegram or discord using screenuploader.bakatrouble.me service.
 
+[Demo video](https://www.youtube.com/watch?v=NOtk0emn10Q)
+
 ## AI Disclaimer
 
 99% of changes are written by AI, particularly Claude Opus 4.7 using Cline plugin. The whole thing costed me like too much money by now, but mostly cause I thought of idiotic implementation for first time. If you are not comfortable with using it cause of that - thats okay. 

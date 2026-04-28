@@ -35,7 +35,7 @@ jobs:
           key: libpng
           path: libpng/libpng-1.6.29-1-arm.tar.xz
       - name: build libpng
-        if: ${{ hashFiles('libpng/libpng-1.6.29-1-arm.tar.xz') != '' }}
+        if: ${{ hashFiles('libpng/libpng-1.6.29-1-arm.tar.xz') == '' }}
         run: |
           chmod 777 libpng -R
           cd libpng
